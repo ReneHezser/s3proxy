@@ -311,10 +311,8 @@ public final class OneDriveBlobStore implements BlobStore {
         return SdkResponses.getResponse(result, response.body());
     }
 
-    // Every failed condition is a 412 echoing the ETag; the frontend turns a
-    // GET If-None-Match or If-Modified-Since miss into 304 Not Modified, as
-    // for the other backends.  Evaluated against Graph's metadata before any
-    // content is downloaded.
+    // Report the actual status: the frontend cannot infer which condition
+    // failed when a request carries multiple conditional headers.
     private static void enforceConditionalGet(GetObjectRequest request,
             JsonNode node) {
         String tag = etag(node);
@@ -322,28 +320,28 @@ public final class OneDriveBlobStore implements BlobStore {
         String ifNoneMatch = request.ifNoneMatch();
         if (ifMatch != null && !"*".equals(ifMatch) &&
                 !tag.equals(unquote(ifMatch))) {
-            throw preconditionFailed(tag);
+            throw conditionFailed(412, tag);
         }
         if (ifNoneMatch != null && ("*".equals(ifNoneMatch) ||
                 tag.equals(unquote(ifNoneMatch)))) {
-            throw preconditionFailed(tag);
+            throw conditionFailed(304, tag);
         }
         // HTTP dates have one-second granularity, Graph's do not.
         Instant modified = modified(node).truncatedTo(ChronoUnit.SECONDS);
         Instant modifiedSince = request.ifModifiedSince();
         if (ifNoneMatch == null && modifiedSince != null &&
                 !modified.isAfter(modifiedSince)) {
-            throw preconditionFailed(tag);
+            throw conditionFailed(304, tag);
         }
         Instant unmodifiedSince = request.ifUnmodifiedSince();
         if (ifMatch == null && unmodifiedSince != null &&
                 modified.isAfter(unmodifiedSince)) {
-            throw preconditionFailed(tag);
+            throw conditionFailed(412, tag);
         }
     }
 
-    private static S3Exception preconditionFailed(String tag) {
-        return S3Exceptions.fromStatusCode(412, "\"" + tag + "\"", Map.of(),
+    private static S3Exception conditionFailed(int status, String tag) {
+        return S3Exceptions.fromStatusCode(status, "\"" + tag + "\"", Map.of(),
                 /*cause=*/ null);
     }
 

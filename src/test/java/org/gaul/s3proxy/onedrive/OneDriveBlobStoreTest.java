@@ -229,25 +229,29 @@ public final class OneDriveBlobStoreTest {
         String tag = put("object", new byte[] {1}).eTag();
         var request = GetObjectRequest.builder().bucket("bucket")
                 .key("object").build();
-        assertConditionalGetFails(request.toBuilder()
-                .ifMatch("wrong").build(), tag);
-        assertConditionalGetFails(request.toBuilder()
-                .ifMatch("wrong").ifNoneMatch(tag).build(), tag);
+        assertConditionalGetStatus(request.toBuilder()
+                .ifMatch("wrong").build(), 412, tag);
+        assertConditionalGetStatus(request.toBuilder()
+                .ifMatch("wrong").ifNoneMatch(tag).build(), 412, tag);
         for (String condition : List.of(tag, "\"" + tag + "\"", "*")) {
-            assertConditionalGetFails(request.toBuilder()
-                    .ifNoneMatch(condition).build(), tag);
+            assertConditionalGetStatus(request.toBuilder()
+                    .ifNoneMatch(condition).build(), 304, tag);
         }
-        assertConditionalGetFails(request.toBuilder()
-                .ifModifiedSince(Instant.parse(TIME)).build(), tag);
-        assertConditionalGetFails(request.toBuilder()
+        assertConditionalGetStatus(request.toBuilder()
+                .ifModifiedSince(Instant.parse(TIME)).build(), 304, tag);
+        assertConditionalGetStatus(request.toBuilder()
                 .ifModifiedSince(Instant.parse(TIME).plusSeconds(1)).build(),
-                tag);
-        assertConditionalGetFails(request.toBuilder()
+                304, tag);
+        assertConditionalGetStatus(request.toBuilder()
                 .ifUnmodifiedSince(Instant.parse(TIME).minusSeconds(1))
-                .build(), tag);
-        assertConditionalGetFails(request.toBuilder().ifNoneMatch(tag)
+                .build(), 412, tag);
+        assertConditionalGetStatus(request.toBuilder().ifNoneMatch(tag)
                 .ifUnmodifiedSince(Instant.parse(TIME).minusSeconds(1))
-                .range("bytes=0-0").build(), tag);
+                .range("bytes=0-0").build(), 304, tag);
+        assertConditionalGetStatus(request.toBuilder().ifMatch(tag)
+                .ifNoneMatch(tag).build(), 304, tag);
+        assertConditionalGetStatus(request.toBuilder().ifMatch(tag)
+                .ifModifiedSince(Instant.parse(TIME)).build(), 304, tag);
     }
 
     @Test
@@ -285,14 +289,12 @@ public final class OneDriveBlobStoreTest {
         }
     }
 
-    // The store reports every failed condition as 412; the frontend maps a
-    // GET If-None-Match or If-Modified-Since miss to 304.
-    private void assertConditionalGetFails(GetObjectRequest request,
-            String tag) {
+    private void assertConditionalGetStatus(GetObjectRequest request,
+            int status, String tag) {
         int before = requestPaths.size();
         assertThatThrownBy(() -> store.getBlob(request))
                 .isInstanceOfSatisfying(S3Exception.class, exception -> {
-                    assertThat(exception.statusCode()).isEqualTo(412);
+                    assertThat(exception.statusCode()).isEqualTo(status);
                     assertThat(exception.awsErrorDetails().sdkHttpResponse()
                             .firstMatchingHeader("ETag"))
                             .contains("\"" + tag + "\"");
@@ -639,6 +641,37 @@ public final class OneDriveBlobStoreTest {
                     .key("object").ifMatch(put.eTag()).ifUnmodifiedSince(
                             Instant.parse(TIME).minusSeconds(1)))
                     .asUtf8String()).isEqualTo("through S3");
+            var conditionalGet = GetObjectRequest.builder().bucket("bucket")
+                    .key("object").build();
+            for (var get : List.of(
+                    conditionalGet.toBuilder().ifMatch(put.eTag())
+                            .ifNoneMatch(put.eTag()).build(),
+                    conditionalGet.toBuilder().ifNoneMatch(put.eTag())
+                            .ifUnmodifiedSince(
+                                    Instant.parse(TIME).minusSeconds(1))
+                            .build(),
+                    conditionalGet.toBuilder().ifMatch(put.eTag())
+                            .ifModifiedSince(Instant.parse(TIME)).build())) {
+                int before = requestPaths.size();
+                assertThatThrownBy(() -> s3.getObjectAsBytes(get))
+                        .isInstanceOfSatisfying(S3Exception.class,
+                                exception -> {
+                                    assertThat(exception.statusCode())
+                                            .isEqualTo(304);
+                                    assertThat(exception.awsErrorDetails()
+                                            .sdkHttpResponse()
+                                            .firstMatchingHeader("ETag"))
+                                            .contains(put.eTag());
+                                });
+                assertThat(requestPaths.subList(before, requestPaths.size()))
+                        .noneMatch(path -> path.endsWith("/content"));
+            }
+            assertThatThrownBy(() -> s3.getObjectAsBytes(
+                    conditionalGet.toBuilder().ifMatch("wrong")
+                            .ifNoneMatch(put.eTag()).build()))
+                    .isInstanceOfSatisfying(S3Exception.class,
+                            exception -> assertThat(exception.statusCode())
+                                    .isEqualTo(412));
             assertThat(s3.listObjectsV2(request -> request.bucket("bucket"))
                     .contents()).extracting("key").containsExactly("object");
             assertThatThrownBy(() -> s3.putObject(request ->

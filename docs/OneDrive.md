@@ -90,6 +90,8 @@ copies and deletes are not supported.
 Conditional GET and HEAD requests evaluate `If-Match`, `If-None-Match`,
 `If-Modified-Since` and `If-Unmodified-Since` against the object's Graph
 metadata before any content is downloaded.
+Not-modified conditions return HTTP 304; failed preconditions return HTTP
+412, including when a request combines conditional headers.
 
 Listings traverse every Graph page and sort locally to provide S3 prefix,
 delimiter and continuation-token semantics, so listing a large bucket costs
