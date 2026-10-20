@@ -538,6 +538,9 @@ public class S3ProxyHandler {
         if (name.contains(".sftp.")) {
             return "sftp";
         }
+        if (name.contains(".onedrive.")) {
+            return "onedrive";
+        }
         if (name.contains(".nio2blob.")) {
             return name.endsWith(".TransientNio2BlobStore") ?
                     "transient" : "filesystem";

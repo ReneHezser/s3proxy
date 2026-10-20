@@ -22,12 +22,14 @@ public final class Quirks {
     /** Blobstores which do not support blob-level access control. */
     public static final Set<String> NO_BLOB_ACCESS_CONTROL = Set.of(
             "azureblob",
+            "onedrive",
             "openstack-swift"
     );
 
     /** Blobstores which do not support the Cache-Control header. */
     public static final Set<String> NO_CACHE_CONTROL_SUPPORT = Set.of(
             "google-cloud-storage",
+            "onedrive",
             "openstack-swift",
             "sftp"
     );
@@ -35,23 +37,26 @@ public final class Quirks {
     /** Blobstores which do not support the Content-Encoding header. */
     public static final Set<String> NO_CONTENT_ENCODING = Set.of(
             "google-cloud-storage",
+            "onedrive",
             "sftp"
     );
 
     /** Blobstores which do not support the Content-Language header. */
     public static final Set<String> NO_CONTENT_LANGUAGE = Set.of(
+            "onedrive",
             "openstack-swift",
             "sftp"
     );
 
     /**
-     * Blobstores which store only the object bytes.  SFTP servers offer no
-     * portable user extended attributes, so everything the nio2 stores keep
-     * in xattrs -- content metadata, user metadata, ETags, checksums,
-     * storage class, and directory-marker identity -- does not survive the
-     * write, and reads report defaults instead.
+     * Blobstores which do not persist S3 metadata. SFTP servers offer no
+     * portable user extended attributes, and OneDrive has no portable
+     * arbitrary metadata on drive items. User metadata, checksums and
+     * upload-time content headers do not survive the write; reads report
+     * backend metadata or defaults instead.
      */
     public static final Set<String> NO_PERSISTED_METADATA = Set.of(
+            "onedrive",
             "sftp"
     );
 
@@ -149,7 +154,8 @@ public final class Quirks {
     /** Blobstores with opaque ETags. */
     public static final Set<String> OPAQUE_ETAG = Set.of(
             "azureblob",
-            "google-cloud-storage"
+            "google-cloud-storage",
+            "onedrive"
     );
 
     /**
@@ -159,6 +165,7 @@ public final class Quirks {
      */
     public static final Set<String> NO_PUBLIC_WRITE_ACCESS = Set.of(
             "azureblob",
+            "onedrive",
             "openstack-swift"
     );
 

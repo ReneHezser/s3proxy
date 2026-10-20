@@ -49,7 +49,7 @@ public final class BlobStoresTest {
     public void testLeavesCurrentNamesAlone() {
         var current = List.of("filesystem", "transient", "aws-s3",
                 "azureblob", "google-cloud-storage", "openstack-swift",
-                "sftp");
+                "onedrive", "sftp");
         for (String provider : current) {
             assertThat(BlobStores.resolveProviderAlias(provider))
                     .isEqualTo(provider);
