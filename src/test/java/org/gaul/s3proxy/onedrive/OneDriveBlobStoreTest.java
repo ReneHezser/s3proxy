@@ -26,6 +26,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -35,20 +36,25 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.gaul.s3proxy.BlobStores;
 import org.gaul.s3proxy.S3Proxy;
 import org.gaul.s3proxy.auth.AuthenticationType;
 import org.gaul.s3proxy.blobstore.BlobStore;
 import org.gaul.s3proxy.blobstore.Credentials;
 import org.gaul.s3proxy.blobstore.MD5;
+import org.gaul.s3proxy.blobstore.S3Exceptions;
 import org.gaul.s3proxy.blobstore.SdkRequests;
+import org.gaul.s3proxy.blobstore.domain.MultipartUpload;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -58,13 +64,17 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.BucketCannedACL;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 
@@ -86,8 +96,11 @@ public final class OneDriveBlobStoreTest {
     private String base;
     private String uploadPath;
     private String nextLink;
+    private String concurrentFolder;
+    private String modifiedTime = TIME;
     private int failure;
     private int uploadFailure;
+    private int folderDeleteFailure;
     private boolean uploadCancelled;
     private int sequence;
 
@@ -179,6 +192,172 @@ public final class OneDriveBlobStoreTest {
                 .containsExactly("pending");
         store.abortMultipartUpload(mpu);
         assertThat(store.listMultipartUploads("bucket")).isEmpty();
+    }
+
+    @Test
+    public void testDelimiterSuffixIsAlwaysACommonPrefix() {
+        store.createContainer("bucket");
+        put("report-", new byte[] {1});
+        var request = ListObjectsV2Request.builder().bucket("bucket")
+                .delimiter("-").maxKeys(1).build();
+        var single = store.list(request);
+        assertThat(single.contents()).isEmpty();
+        assertThat(single.commonPrefixes()).extracting("prefix")
+                .containsExactly("report-");
+        assertThat(single.keyCount()).isEqualTo(1);
+
+        put("report-part", new byte[] {2, 3});
+        put("z", new byte[] {4});
+        var first = store.list(request);
+        assertThat(first.contents()).isEmpty();
+        assertThat(first.commonPrefixes()).extracting("prefix")
+                .containsExactly("report-");
+        assertThat(first.isTruncated()).isTrue();
+        var next = store.list(request.toBuilder()
+                .continuationToken(first.nextContinuationToken()).build());
+        assertThat(next.commonPrefixes()).isEmpty();
+        assertThat(next.contents()).extracting("key").containsExactly("z");
+        assertThat(next.isTruncated()).isFalse();
+        assertThat(store.list(request.toBuilder().prefix("report-").build())
+                .contents()).extracting("key").containsExactly("report-");
+    }
+
+    @Test
+    public void testConditionalGetFailuresDoNotDownloadContent() {
+        store.createContainer("bucket");
+        modifiedTime = "2026-01-01T00:00:00.123Z";
+        String tag = put("object", new byte[] {1}).eTag();
+        var request = GetObjectRequest.builder().bucket("bucket")
+                .key("object").build();
+        assertConditionalGetFails(request.toBuilder()
+                .ifMatch("wrong").build(), tag);
+        assertConditionalGetFails(request.toBuilder()
+                .ifMatch("wrong").ifNoneMatch(tag).build(), tag);
+        for (String condition : List.of(tag, "\"" + tag + "\"", "*")) {
+            assertConditionalGetFails(request.toBuilder()
+                    .ifNoneMatch(condition).build(), tag);
+        }
+        assertConditionalGetFails(request.toBuilder()
+                .ifModifiedSince(Instant.parse(TIME)).build(), tag);
+        assertConditionalGetFails(request.toBuilder()
+                .ifModifiedSince(Instant.parse(TIME).plusSeconds(1)).build(),
+                tag);
+        assertConditionalGetFails(request.toBuilder()
+                .ifUnmodifiedSince(Instant.parse(TIME).minusSeconds(1))
+                .build(), tag);
+        assertConditionalGetFails(request.toBuilder().ifNoneMatch(tag)
+                .ifUnmodifiedSince(Instant.parse(TIME).minusSeconds(1))
+                .range("bytes=0-0").build(), tag);
+    }
+
+    @Test
+    public void testConditionalGetSuccessAndPrecedence() throws IOException {
+        store.createContainer("bucket");
+        modifiedTime = "2026-01-01T00:00:00.123Z";
+        byte[] content = {1, 2, 3};
+        String tag = put("object", content).eTag();
+        var request = GetObjectRequest.builder().bucket("bucket")
+                .key("object").build();
+        for (var get : List.of(
+                request.toBuilder().ifMatch(tag).build(),
+                request.toBuilder().ifMatch("\"" + tag + "\"").build(),
+                request.toBuilder().ifMatch("*").build(),
+                request.toBuilder().ifNoneMatch("wrong").build(),
+                request.toBuilder().ifModifiedSince(
+                        Instant.parse(TIME).minusSeconds(1)).build(),
+                request.toBuilder().ifUnmodifiedSince(
+                        Instant.parse(TIME)).build(),
+                request.toBuilder().ifMatch(tag).ifUnmodifiedSince(
+                        Instant.parse(TIME).minusSeconds(1)).build(),
+                request.toBuilder().ifNoneMatch("wrong").ifModifiedSince(
+                        Instant.parse(TIME).plusSeconds(1)).build())) {
+            try (var result = store.getBlob(get)) {
+                assertThat(result.readAllBytes()).isEqualTo(content);
+                assertThat(result.response().eTag()).isEqualTo(tag);
+            }
+        }
+        try (var result = store.getBlob(request.toBuilder()
+                .ifMatch(tag).range("bytes=1-2").build())) {
+            assertThat(result.readAllBytes()).containsExactly((byte) 2,
+                    (byte) 3);
+            assertThat(result.response().contentRange())
+                    .isEqualTo("bytes 1-2/3");
+        }
+    }
+
+    // The store reports every failed condition as 412; the frontend maps a
+    // GET If-None-Match or If-Modified-Since miss to 304.
+    private void assertConditionalGetFails(GetObjectRequest request,
+            String tag) {
+        int before = requestPaths.size();
+        assertThatThrownBy(() -> store.getBlob(request))
+                .isInstanceOfSatisfying(S3Exception.class, exception -> {
+                    assertThat(exception.statusCode()).isEqualTo(412);
+                    assertThat(exception.awsErrorDetails().sdkHttpResponse()
+                            .firstMatchingHeader("ETag"))
+                            .contains("\"" + tag + "\"");
+                });
+        assertThat(requestPaths.subList(before, requestPaths.size()))
+                .noneMatch(path -> path.endsWith("/content"));
+    }
+
+    @Test
+    public void testUploadsReplaceEmptyDirectoryTrees() throws IOException {
+        store.createContainer("bucket");
+        for (int size : List.of(3, 4 * 1024 * 1024 + 1)) {
+            put("a/b/c", new byte[] {1});
+            store.removeBlob("bucket", "a/b/c");
+            assertThat(store.list("bucket").contents()).isEmpty();
+            byte[] content = new byte[size];
+            Arrays.fill(content, (byte) 7);
+            put("A", content);
+            try (var result = store.getBlob("bucket", "a")) {
+                assertThat(result.readAllBytes()).isEqualTo(content);
+            }
+            store.removeBlob("bucket", "a");
+        }
+    }
+
+    @Test
+    public void testUploadsPreserveNonemptyDirectories() throws IOException {
+        store.createContainer("bucket");
+        put("a/empty/file", new byte[] {1});
+        store.removeBlob("bucket", "a/empty/file");
+        put("a/live/file", new byte[] {2});
+        for (int size : List.of(3, 4 * 1024 * 1024 + 1)) {
+            assertThatThrownBy(() -> put("a", new byte[size]))
+                    .isInstanceOf(S3Exception.class)
+                    .hasMessageContaining("nonempty folder");
+        }
+        assertThat(nodes).containsKey("bucket/a/empty");
+        try (var result = store.getBlob("bucket", "a/live/file")) {
+            assertThat(result.readAllBytes()).containsExactly((byte) 2);
+        }
+    }
+
+    @Test
+    public void testFolderReplacementRefusesConcurrentChanges()
+            throws IOException {
+        store.createContainer("bucket");
+        put("a/file", new byte[] {1});
+        store.removeBlob("bucket", "a/file");
+        concurrentFolder = "bucket/a";
+        assertThatThrownBy(() -> put("a", new byte[] {2}))
+                .isInstanceOfSatisfying(S3Exception.class,
+                        exception -> assertThat(exception.statusCode())
+                                .isEqualTo(412));
+        try (var result = store.getBlob("bucket", "a/concurrent")) {
+            assertThat(result.readAllBytes()).containsExactly((byte) 9);
+        }
+        for (int status : List.of(403, 429, 503)) {
+            store.removeBlob("bucket", "a/concurrent");
+            folderDeleteFailure = status;
+            assertThatThrownBy(() -> put("a", new byte[] {2}))
+                    .isInstanceOfSatisfying(S3Exception.class,
+                            exception -> assertThat(exception.statusCode())
+                                    .isEqualTo(status));
+            assertThat(nodes).containsKey("bucket/a");
+        }
     }
 
     @Test
@@ -274,6 +453,71 @@ public final class OneDriveBlobStoreTest {
     }
 
     @Test
+    public void testMissingBucketsKeysAndUploadsReportS3Errors() {
+        var listing = ListObjectsV2Request.builder().bucket("missing").build();
+        assertThatThrownBy(() -> store.blobMetadata("missing", "key"))
+                .isInstanceOf(NoSuchBucketException.class);
+        assertThatThrownBy(() -> put("key", new byte[0]))
+                .isInstanceOf(NoSuchBucketException.class);
+        assertThatThrownBy(() -> store.list(listing))
+                .isInstanceOf(NoSuchBucketException.class);
+        store.deleteBucket("missing");
+
+        store.createContainer("bucket");
+        assertThat(store.blobMetadataIfPresent("bucket", "missing")).isNull();
+        assertThatThrownBy(() -> store.getBlob("bucket", "missing"))
+                .isInstanceOf(NoSuchKeyException.class);
+        assertThatThrownBy(() -> store.copyBlob(CopyObjectRequest.builder()
+                .sourceBucket("bucket").sourceKey("missing")
+                .destinationBucket("bucket").destinationKey("copy").build()))
+                .isInstanceOf(NoSuchKeyException.class);
+        assertThat(store.blobExists("bucket", "copy")).isFalse();
+
+        var request = CreateMultipartUploadRequest.builder()
+                .bucket("bucket").key("key").build();
+        for (String id : List.of(UUID.randomUUID().toString(), "not-a-uuid")) {
+            assertErrorCode("NoSuchUpload", () -> store.abortMultipartUpload(
+                    new MultipartUpload(id, request)));
+        }
+    }
+
+    @Test
+    public void testMultipartCompletionRejectsInvalidParts() {
+        store.createContainer("bucket");
+        var mpu = store.initiateMultipartUpload(
+                CreateMultipartUploadRequest.builder()
+                        .bucket("bucket").key("assembled").build());
+        assertErrorCode("InvalidArgument", () -> store.uploadMultipartPart(
+                mpu, UploadPartRequest.builder().partNumber(0)
+                        .contentLength(1L).build(),
+                new ByteArrayInputStream(new byte[] {1})));
+        var first = store.uploadMultipartPart(mpu,
+                UploadPartRequest.builder().partNumber(1).contentLength(1L)
+                        .build(), new ByteArrayInputStream(new byte[] {1}));
+        var last = store.uploadMultipartPart(mpu,
+                UploadPartRequest.builder().partNumber(2).contentLength(1L)
+                        .build(), new ByteArrayInputStream(new byte[] {2}));
+
+        // a nonfinal part below the minimum size
+        assertErrorCode("InvalidArgument", () ->
+                store.completeMultipartUpload(mpu, SdkRequests.completeRequest(
+                        mpu, List.of(completed(1, first.eTag()),
+                                completed(2, last.eTag())))));
+        // an ETag that is not the part's, and a part never uploaded
+        assertErrorCode("InvalidArgument", () ->
+                store.completeMultipartUpload(mpu, SdkRequests.completeRequest(
+                        mpu, List.of(completed(2, "wrong")))));
+        assertErrorCode("InvalidArgument", () ->
+                store.completeMultipartUpload(mpu, SdkRequests.completeRequest(
+                        mpu, List.of(completed(3, last.eTag())))));
+        assertThat(store.blobExists("bucket", "assembled")).isFalse();
+        assertThat(store.listMultipartUploads("bucket")).hasSize(1);
+
+        store.abortMultipartUpload(mpu);
+        assertErrorCode("NoSuchUpload", () -> store.abortMultipartUpload(mpu));
+    }
+
+    @Test
     public void testCredentialsRefreshAndErrorsAreNotHidden() {
         store.list();
         credentials.set(new Credentials("", "", "second-token"));
@@ -321,8 +565,7 @@ public final class OneDriveBlobStoreTest {
                 .build(), new ByteArrayInputStream(payload)))
                 .isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(() -> store.setContainerAccess("bucket",
-                software.amazon.awssdk.services.s3.model.BucketCannedACL
-                        .PUBLIC_READ))
+                BucketCannedACL.PUBLIC_READ))
                 .isInstanceOf(UnsupportedOperationException.class);
         put("file", payload);
         assertThatThrownBy(() -> store.setBlobAccess("bucket", "file",
@@ -363,6 +606,39 @@ public final class OneDriveBlobStoreTest {
             assertThat(put.eTag()).contains("-1");
             assertThat(s3.getObjectAsBytes(request -> request.bucket("bucket")
                     .key("object")).asUtf8String()).isEqualTo("through S3");
+            assertThatThrownBy(() -> s3.getObjectAsBytes(request ->
+                    request.bucket("bucket").key("object")
+                            .ifNoneMatch(put.eTag())))
+                    .isInstanceOfSatisfying(S3Exception.class, exception -> {
+                        assertThat(exception.statusCode()).isEqualTo(304);
+                        assertThat(exception.awsErrorDetails()
+                                .sdkHttpResponse()
+                                .firstMatchingHeader("ETag"))
+                                .contains(put.eTag());
+                    });
+            assertThatThrownBy(() -> s3.getObjectAsBytes(request ->
+                    request.bucket("bucket").key("object")
+                            .ifMatch("wrong")))
+                    .isInstanceOfSatisfying(S3Exception.class,
+                            exception -> assertThat(exception.statusCode())
+                                    .isEqualTo(412));
+            assertThatThrownBy(() -> s3.getObjectAsBytes(request ->
+                    request.bucket("bucket").key("object")
+                            .ifModifiedSince(Instant.parse(TIME))))
+                    .isInstanceOfSatisfying(S3Exception.class,
+                            exception -> assertThat(exception.statusCode())
+                                    .isEqualTo(304));
+            assertThatThrownBy(() -> s3.getObjectAsBytes(request ->
+                    request.bucket("bucket").key("object")
+                            .ifUnmodifiedSince(
+                                    Instant.parse(TIME).minusSeconds(1))))
+                    .isInstanceOfSatisfying(S3Exception.class,
+                            exception -> assertThat(exception.statusCode())
+                                    .isEqualTo(412));
+            assertThat(s3.getObjectAsBytes(request -> request.bucket("bucket")
+                    .key("object").ifMatch(put.eTag()).ifUnmodifiedSince(
+                            Instant.parse(TIME).minusSeconds(1)))
+                    .asUtf8String()).isEqualTo("through S3");
             assertThat(s3.listObjectsV2(request -> request.bucket("bucket"))
                     .contents()).extracting("key").containsExactly("object");
             assertThatThrownBy(() -> s3.putObject(request ->
@@ -398,8 +674,19 @@ public final class OneDriveBlobStoreTest {
         }
     }
 
-    private software.amazon.awssdk.services.s3.model.PutObjectResponse put(
-            String key, byte[] payload) {
+    private static CompletedPart completed(int partNumber, String eTag) {
+        return CompletedPart.builder().partNumber(partNumber).eTag(eTag)
+                .build();
+    }
+
+    private static void assertErrorCode(String code,
+            ThrowingCallable operation) {
+        assertThatThrownBy(operation).isInstanceOfSatisfying(
+                S3Exception.class, exception -> assertThat(
+                        S3Exceptions.errorCode(exception)).isEqualTo(code));
+    }
+
+    private PutObjectResponse put(String key, byte[] payload) {
         return store.putBlob(PutObjectRequest.builder()
                 .bucket("bucket").key(key)
                 .contentLength((long) payload.length).build(),
@@ -413,11 +700,22 @@ public final class OneDriveBlobStoreTest {
         result.put("size", content.length);
         result.put("eTag", "\"" + sequence + "\"");
         result.put("createdDateTime", TIME);
-        result.put("lastModifiedDateTime", TIME);
+        result.put("lastModifiedDateTime", modifiedTime);
         result.set(folder ? "folder" : "file", MAPPER.createObjectNode());
         nodes.put(path.toLowerCase(Locale.ROOT), result);
         data.put(result.path("id").asText(), content);
+        touchParent(path);
         return result;
+    }
+
+    private void touchParent(String path) {
+        if (!path.isEmpty()) {
+            String parent = path.substring(0, Math.max(0,
+                    path.lastIndexOf('/'))).toLowerCase(Locale.ROOT);
+            if (nodes.get(parent) instanceof ObjectNode folder) {
+                folder.put("eTag", "\"folder-" + sequence++ + "\"");
+            }
+        }
     }
 
     private String pathById(String id) {
@@ -460,6 +758,9 @@ public final class OneDriveBlobStoreTest {
                     return;
                 }
                 if (uploadFailure != 0) {
+                    // Reading the fragment first keeps the client from
+                    // seeing a reset connection instead of the status.
+                    exchange.getRequestBody().readAllBytes();
                     respondJson(exchange, uploadFailure, Map.of());
                     return;
                 }
@@ -511,7 +812,11 @@ public final class OneDriveBlobStoreTest {
             String target = parent + (parent.isEmpty() || suffix.isEmpty() ?
                     "" : "/") + suffix.toLowerCase(Locale.ROOT);
             JsonNode existing = nodes.get(target);
-            if ("/content".equals(operation) && "PUT".equals(method)) {
+            if (existing != null && existing.has("folder") &&
+                    (("/content".equals(operation) && "PUT".equals(method)) ||
+                    "/createUploadSession".equals(operation))) {
+                respondJson(exchange, 409, Map.of());
+            } else if ("/content".equals(operation) && "PUT".equals(method)) {
                 respondJson(exchange, 201, node(target, false,
                         exchange.getRequestBody().readAllBytes()));
             } else if ("/createUploadSession".equals(operation)) {
@@ -558,8 +863,24 @@ public final class OneDriveBlobStoreTest {
                         base + "/download/" + existing.path("id").asText());
                 respond(exchange, 302, new byte[0]);
             } else if ("DELETE".equals(method)) {
+                String ifMatch = exchange.getRequestHeaders()
+                        .getFirst("If-Match");
+                if (target.equals(concurrentFolder)) {
+                    concurrentFolder = null;
+                    node(target + "/concurrent", false, new byte[] {9});
+                }
+                if (ifMatch != null && folderDeleteFailure != 0) {
+                    respondJson(exchange, folderDeleteFailure, Map.of());
+                    return;
+                }
+                if (ifMatch != null &&
+                        !ifMatch.equals(existing.path("eTag").asText())) {
+                    respondJson(exchange, 412, Map.of());
+                    return;
+                }
                 nodes.keySet().removeIf(key -> key.equals(target) ||
                         key.startsWith(target + "/"));
+                touchParent(target);
                 respond(exchange, 204, new byte[0]);
             } else {
                 respondJson(exchange, 200, existing);

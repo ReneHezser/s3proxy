@@ -9,7 +9,7 @@ S3Proxy implements the
 [S3 API](https://en.wikipedia.org/wiki/Amazon_S3#S3_API_and_competing_services)
 and *proxies* requests, enabling several use cases:
 
-* translation from S3 to Google Cloud, Microsoft Azure, OpenStack Swift, and SFTP
+* translation from S3 to Google Cloud, Microsoft Azure, Microsoft OneDrive, OpenStack Swift, and SFTP
 * testing without Amazon by using the local filesystem
 * extension via middlewares
 * embedding into Java applications
@@ -94,9 +94,8 @@ See the wiki for [examples of configurations](https://github.com/gaul/s3proxy/wi
 `jclouds.identity` and `jclouds.credential` name the enduring half of a backend
 credential.  Credentials that expire carry a third part, which
 `jclouds.session-token` names: an AWS session token, an Azure shared access
-signature, a Google OAuth 2.0 access token, or a Keystone token.
-The `onedrive` backend also reads its Microsoft Graph access token from
-`jclouds.session-token` and re-reads the credential supplier on each request.
+signature, a Google OAuth 2.0 access token, a Microsoft Graph access token, or a Keystone token.
+The `onedrive` backend re-reads the credential supplier on each request.
 
 ```
 jclouds.provider=aws-s3
@@ -126,54 +125,11 @@ Keystone token it holds nears its expiry.
 
 ### OneDrive
 
-Use a Microsoft Graph access token with read/write access to the target
-drive (delegated `Files.ReadWrite`, or the appropriate application
-permissions and administrator consent for the chosen drive):
-
-```properties
-s3proxy.authorization=aws-v4
-s3proxy.identity=local-access-key
-s3proxy.credential=local-secret-key
-s3proxy.endpoint=http://127.0.0.1:8080
-jclouds.provider=onedrive
-jclouds.session-token=MICROSOFT_GRAPH_ACCESS_TOKEN
-# Optional: drive ID; omitted uses /me/drive (delegated tokens only).
-# jclouds.identity=DRIVE_ID
-# Optional: existing folder item ID; omitted uses the drive root.
-# s3proxy.onedrive.root=FOLDER_ITEM_ID
-# Optional: Graph API endpoint, for example for a sovereign cloud.
-# jclouds.endpoint=https://graph.microsoft.com/v1.0
-```
-
-The backend does not perform interactive sign-in or refresh a static token.
-For long-running deployments, embed S3Proxy with a `Supplier<Credentials>`
-that renews the access token. Tokens must target the configured Graph cloud.
-
-Buckets map to folders underneath the selected root; objects map to files
-and slash-separated subfolders. Use a dedicated root folder: existing
-folders and files there are exposed as buckets and objects. OneDrive names
-are case-insensitive and subject to OneDrive's path/size restrictions.
-Empty path segments, `.`/`..`, directory-marker keys ending in `/`, trailing
-dots, leading/trailing spaces, control characters and `"*:<>?\\|` are
-rejected. An object cannot also be a parent directory (`a` and `a/b`).
-The `.s3proxy-multipart/` prefix is reserved within every bucket.
-
-Uploads are staged on local temporary disk, then sent to Graph; files larger
-than 4 MiB use upload sessions with bounded-memory fragments. Multipart
-parts and their target are kept in OneDrive, survive proxy restarts, and
-are hidden from object listings. Completion stages the selected parts on
-local disk; allow enough temporary space for the assembled object and its
-upload staging copy. CopyObject streams through the proxy rather than
-performing an asynchronous Graph copy.
-
-Only private S3 ACLs are supported; they do not alter any sharing permissions
-already configured in OneDrive. User metadata, flexible checksums and
-Content-* headers supplied on upload are not persisted; reads use Graph's
-detected MIME type, modification time and opaque ETag. Conditional writes
-and copies, S3 versioning and S3 server-side-encryption requests are not
-supported.
-Listings traverse Graph pages and sort locally to provide S3 prefix,
-delimiter and continuation-token semantics.
+Set `jclouds.provider=onedrive` and a Microsoft Graph access token in
+`jclouds.session-token`; `jclouds.identity` optionally names a drive ID and
+`s3proxy.onedrive.root` a folder item ID to use as the root.  Buckets are
+folders below that root.  See [docs/OneDrive.md](docs/OneDrive.md) for the
+configuration, storage mapping and limitations.
 
 ## Assigning buckets to backends
 
@@ -246,20 +202,20 @@ Some limitations depend on the storage backend:
 
 | limitation | backends |
 | --- | --- |
-| no per-object ACLs, including public-read | `azureblob`, `openstack-swift` |
-| ETag is not the object MD5 | `azureblob`, `google-cloud-storage` |
-| `Cache-Control` not preserved | `google-cloud-storage`, `openstack-swift` |
-| `Content-Encoding` not preserved | `google-cloud-storage` |
-| `Content-Language` not preserved | `openstack-swift` |
+| no per-object ACLs, including public-read | `azureblob`, `onedrive`, `openstack-swift` |
+| ETag is not the object MD5 | `azureblob`, `google-cloud-storage`, `onedrive` |
+| `Cache-Control` not preserved | `google-cloud-storage`, `onedrive`, `openstack-swift` |
+| `Content-Encoding` not preserved | `google-cloud-storage`, `onedrive` |
+| `Content-Language` not preserved | `onedrive`, `openstack-swift` |
 | `Expires` not preserved | `azureblob` |
 | `max-keys=0` not honored | `azureblob` |
-| `UploadPartCopy` streams the data through S3Proxy instead of copying it on the backend | `filesystem`, `transient`, `openstack-swift`, `sftp` |
+| `UploadPartCopy` streams the data through S3Proxy instead of copying it on the backend | `filesystem`, `transient`, `onedrive`, `openstack-swift`, `sftp` |
 | conditional PUT refuses `If-Match`, honoring only `If-None-Match: *` | `openstack-swift` |
 | no object versioning, see [#1137](https://github.com/gaul/s3proxy/issues/1137) | `azureblob` |
 | no object versioning, see [#1138](https://github.com/gaul/s3proxy/issues/1138) | `filesystem` |
-| no object versioning, for want of a service analog | `openstack-swift`, `sftp` |
+| no object versioning, for want of a service analog | `onedrive`, `openstack-swift`, `sftp` |
 | no server-side encryption, see [#1134](https://github.com/gaul/s3proxy/issues/1134) | `google-cloud-storage` |
-| no server-side encryption, by design or for want of a service analog | `filesystem`, `openstack-swift`, `sftp` |
+| no server-side encryption, by design or for want of a service analog | `filesystem`, `onedrive`, `openstack-swift`, `sftp` |
 | SSE-S3 only: AES256 relayed from Azure's own at-rest encryption; SSE-C ([#1135](https://github.com/gaul/s3proxy/issues/1135)) and SSE-KMS refused | `azureblob` |
 
 The backends that do version objects come by it differently.  `aws-s3`

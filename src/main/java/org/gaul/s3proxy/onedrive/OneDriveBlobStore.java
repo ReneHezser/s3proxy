@@ -16,6 +16,7 @@
 
 package org.gaul.s3proxy.onedrive;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -28,11 +29,14 @@ import java.net.http.HttpResponse.BodyHandlers;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.HexFormat;
@@ -40,6 +44,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -55,6 +60,7 @@ import org.jspecify.annotations.Nullable;
 
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.services.s3.model.BucketCannedACL;
+import software.amazon.awssdk.services.s3.model.CommonPrefix;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
@@ -124,7 +130,6 @@ public final class OneDriveBlobStore implements BlobStore {
                 "/root" : "/items/" + encode(root);
         token();
     }
-
     @Override
     public HeadBucketResponse headBucket(HeadBucketRequest request) {
         bucket(request.bucket());
@@ -197,21 +202,22 @@ public final class OneDriveBlobStore implements BlobStore {
             if (!key.startsWith(prefix)) {
                 continue;
             }
+            boolean commonPrefix = false;
             if (delimiter != null && !delimiter.isEmpty()) {
                 int index = key.indexOf(delimiter, prefix.length());
                 if (index != -1) {
                     key = key.substring(0, index + delimiter.length());
+                    commonPrefix = true;
                 }
             }
             if (marker == null || key.compareTo(marker) > 0) {
-                selected.put(key, entries.containsKey(key) ?
-                        entry.getValue() : MAPPER.createObjectNode());
+                selected.put(key, commonPrefix ? MAPPER.createObjectNode() :
+                        entry.getValue());
             }
         }
         int maxKeys = request.maxKeys() == null ? 1000 : request.maxKeys();
         var objects = new ArrayList<S3Object>();
-        var prefixes = new ArrayList<
-                software.amazon.awssdk.services.s3.model.CommonPrefix>();
+        var prefixes = new ArrayList<CommonPrefix>();
         String last = null;
         int count = 0;
         for (var entry : selected.entrySet()) {
@@ -281,6 +287,7 @@ public final class OneDriveBlobStore implements BlobStore {
             GetObjectRequest request) {
         rejectVersion(request.versionId());
         JsonNode node = object(request.bucket(), request.key());
+        enforceConditionalGet(request, node);
         var headers = request.range() == null ? Map.<String, String>of() :
                 Map.of("Range", request.range());
         var response = send("GET", byId(node) + "/content",
@@ -302,6 +309,42 @@ public final class OneDriveBlobStore implements BlobStore {
                         "Content-Range").orElse(null))
                 .build();
         return SdkResponses.getResponse(result, response.body());
+    }
+
+    // Every failed condition is a 412 echoing the ETag; the frontend turns a
+    // GET If-None-Match or If-Modified-Since miss into 304 Not Modified, as
+    // for the other backends.  Evaluated against Graph's metadata before any
+    // content is downloaded.
+    private static void enforceConditionalGet(GetObjectRequest request,
+            JsonNode node) {
+        String tag = etag(node);
+        String ifMatch = request.ifMatch();
+        String ifNoneMatch = request.ifNoneMatch();
+        if (ifMatch != null && !"*".equals(ifMatch) &&
+                !tag.equals(unquote(ifMatch))) {
+            throw preconditionFailed(tag);
+        }
+        if (ifNoneMatch != null && ("*".equals(ifNoneMatch) ||
+                tag.equals(unquote(ifNoneMatch)))) {
+            throw preconditionFailed(tag);
+        }
+        // HTTP dates have one-second granularity, Graph's do not.
+        Instant modified = modified(node).truncatedTo(ChronoUnit.SECONDS);
+        Instant modifiedSince = request.ifModifiedSince();
+        if (ifNoneMatch == null && modifiedSince != null &&
+                !modified.isAfter(modifiedSince)) {
+            throw preconditionFailed(tag);
+        }
+        Instant unmodifiedSince = request.ifUnmodifiedSince();
+        if (ifMatch == null && unmodifiedSince != null &&
+                modified.isAfter(unmodifiedSince)) {
+            throw preconditionFailed(tag);
+        }
+    }
+
+    private static S3Exception preconditionFailed(String tag) {
+        return S3Exceptions.fromStatusCode(412, "\"" + tag + "\"", Map.of(),
+                /*cause=*/ null);
     }
 
     @Override
@@ -389,7 +432,7 @@ public final class OneDriveBlobStore implements BlobStore {
         byte[] target = request.key().getBytes(StandardCharsets.UTF_8);
         try {
             putFile(path + "/target", (long) target.length, null,
-                    new java.io.ByteArrayInputStream(target));
+                    new ByteArrayInputStream(target));
         } catch (RuntimeException failure) {
             try {
                 json("DELETE", item(path), null);
@@ -574,7 +617,7 @@ public final class OneDriveBlobStore implements BlobStore {
         try {
             try (var input = new DigestInputStream(payload, digest)) {
                 Files.copy(input, temporary,
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                        StandardCopyOption.REPLACE_EXISTING);
             }
             long size = Files.size(temporary);
             if (length != null && length != size) {
@@ -586,6 +629,7 @@ public final class OneDriveBlobStore implements BlobStore {
                 throw S3Exceptions.fromStatusCode(400);
             }
             ensureFolder(path.substring(0, path.lastIndexOf('/')));
+            removeEmptyDestinationFolder(path);
             if (size <= SIMPLE_UPLOAD_LIMIT) {
                 return readJson(send("PUT", item(path) + "/content",
                         HttpRequest.BodyPublishers.ofFile(temporary),
@@ -636,6 +680,51 @@ public final class OneDriveBlobStore implements BlobStore {
         } finally {
             deleteTemporary(temporary);
         }
+    }
+
+    private void removeEmptyDestinationFolder(String path) {
+        JsonNode node;
+        try {
+            node = json("GET", item(path), null);
+        } catch (S3Exception se) {
+            if (se.statusCode() == 404) {
+                return;
+            }
+            throw se;
+        }
+        if (!node.has("folder")) {
+            return;
+        }
+        var folders = new ArrayList<JsonNode>();
+        collectEmptyFolders(node, folders);
+        for (JsonNode folder : folders) {
+            JsonNode current = json("GET", byId(folder), null);
+            if (!children(byId(current)).isEmpty()) {
+                throw S3Exceptions.invalidRequest(
+                        "A nonempty folder occupies the object key");
+            }
+            String tag = current.path("eTag").asText();
+            if (tag.isEmpty()) {
+                throw S3Exceptions.invalidRequest(
+                        "Cannot safely replace a folder without an ETag");
+            }
+            // Graph deletes folders recursively, so pin each empty-folder
+            // removal to the version whose children were checked.
+            readJson(send("DELETE", byId(current),
+                    HttpRequest.BodyPublishers.noBody(),
+                    Map.of("If-Match", tag), true));
+        }
+    }
+
+    private void collectEmptyFolders(JsonNode folder, List<JsonNode> folders) {
+        for (JsonNode child : children(byId(folder))) {
+            if (!child.has("folder")) {
+                throw S3Exceptions.invalidRequest(
+                        "A nonempty folder occupies the object key");
+            }
+            collectEmptyFolders(child, folders);
+        }
+        folders.add(folder);
     }
 
     private JsonNode bucket(String container) {
@@ -722,9 +811,9 @@ public final class OneDriveBlobStore implements BlobStore {
         if (path.isEmpty()) {
             return base;
         }
-        return base + ":/" + java.util.Arrays.stream(path.split("/", -1))
+        return base + ":/" + Arrays.stream(path.split("/", -1))
                 .map(OneDriveBlobStore::encode)
-                .collect(java.util.stream.Collectors.joining("/")) + ":";
+                .collect(Collectors.joining("/")) + ":";
     }
 
     private String byId(JsonNode node) {
@@ -924,7 +1013,7 @@ public final class OneDriveBlobStore implements BlobStore {
 
     private static void deleteTemporary(Path path) {
         try {
-            Files.delete(path);
+            Files.deleteIfExists(path);
         } catch (IOException ioe) {
             throw new UncheckedIOException(ioe);
         }
