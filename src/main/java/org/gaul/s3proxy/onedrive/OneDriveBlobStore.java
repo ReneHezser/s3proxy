@@ -524,9 +524,15 @@ public final class OneDriveBlobStore implements BlobStore {
         var uploads = new ArrayList<
                 software.amazon.awssdk.services.s3.model.MultipartUpload>();
         for (JsonNode node : children(byId(folder))) {
-            JsonNode target = json("GET", byId(node) + ":/target:", null);
-            uploads.add(SdkResponses.upload(readTarget(target),
-                    node.path("name").asText(), created(node)));
+            try {
+                JsonNode target = json("GET", byId(node) + ":/target:", null);
+                uploads.add(SdkResponses.upload(readTarget(target),
+                        node.path("name").asText(), created(node)));
+            } catch (S3Exception se) {
+                if (se.statusCode() != 404) {
+                    throw se;
+                }
+            }
         }
         return uploads;
     }
