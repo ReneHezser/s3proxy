@@ -819,8 +819,10 @@ public final class OneDriveBlobStore implements BlobStore {
     }
 
     private void ensureFolder(String path) {
-        String parent = item("");
-        for (String segment : path.split("/", -1)) {
+        String[] segments = path.split("/", -1);
+        String parent = byId(bucket(segments[0]));
+        for (int index = 1; index < segments.length; ++index) {
+            String segment = segments[index];
             String next = parent + ":/" + encode(segment) + ":";
             JsonNode node;
             try {
