@@ -93,6 +93,13 @@ metadata before any content is downloaded.
 Not-modified conditions return HTTP 304; failed preconditions return HTTP
 412, including when a request combines conditional headers.
 
+Downloads (including range requests) are staged on local temporary disk before
+being returned, then the item ID and Graph ETag are checked again. Concurrent
+changes discard the staged content and retry with fresh metadata and conditional
+checks, up to three download attempts. Persistent changes return HTTP 503.
+Allow temporary disk space for each concurrent download; its staged file is
+removed when the response stream is closed.
+
 Listings traverse every Graph page and sort locally to provide S3 prefix,
 delimiter and continuation-token semantics, so listing a large bucket costs
 one Graph request per folder page.

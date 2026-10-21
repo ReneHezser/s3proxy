@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -98,6 +99,8 @@ public final class OneDriveBlobStoreTest {
     private String nextLink;
     private String concurrentFolder;
     private String modifiedTime = TIME;
+    private Runnable beforeDownload;
+    private Runnable duringDownload;
     private int failure;
     private int uploadFailure;
     private int folderDeleteFailure;
@@ -287,6 +290,153 @@ public final class OneDriveBlobStoreTest {
             assertThat(result.response().contentRange())
                     .isEqualTo("bytes 1-2/3");
         }
+    }
+
+    @Test
+    public void testDownloadRetriesOverwriteWithSameItemId()
+            throws IOException {
+        store.createContainer("bucket");
+        put("object", new byte[] {1});
+        String id = nodes.get("bucket/object").path("id").asText();
+        beforeDownload = () -> {
+            beforeDownload = null;
+            modifiedTime = "2026-01-02T00:00:00Z";
+            overwrite("bucket/object", new byte[] {2, 3});
+        };
+        requestPaths.clear();
+        try (var result = store.getBlob("bucket", "object")) {
+            assertThat(result.readAllBytes()).containsExactly((byte) 2,
+                    (byte) 3);
+            assertThat(result.response().eTag()).isEqualTo(
+                    store.blobMetadata("bucket", "object").eTag());
+            assertThat(result.response().lastModified())
+                    .isEqualTo(Instant.parse(modifiedTime));
+            assertThat(result.response().contentLength()).isEqualTo(2);
+        }
+        assertThat(nodes.get("bucket/object").path("id").asText())
+                .isEqualTo(id);
+        assertThat(requestPaths.stream()
+                .filter(path -> path.endsWith("/content")).count())
+                .isEqualTo(2);
+    }
+
+    @Test
+    public void testRangeDownloadRetriesChangeDuringBody() throws IOException {
+        store.createContainer("bucket");
+        put("object", new byte[] {1, 2, 3});
+        duringDownload = () -> {
+            duringDownload = null;
+            overwrite("bucket/object", new byte[] {4, 5, 6, 7});
+        };
+        try (var result = store.getBlob(GetObjectRequest.builder()
+                .bucket("bucket").key("object").range("bytes=1-2").build())) {
+            assertThat(result.readAllBytes()).containsExactly((byte) 5,
+                    (byte) 6);
+            assertThat(result.response().contentRange())
+                    .isEqualTo("bytes 1-2/4");
+            assertThat(result.response().contentLength()).isEqualTo(2);
+            assertThat(result.response().eTag()).isEqualTo(
+                    store.blobMetadata("bucket", "object").eTag());
+        }
+    }
+
+    @Test
+    public void testDownloadRechecksIfMatchAfterOverwrite() {
+        store.createContainer("bucket");
+        String tag = put("object", new byte[] {1}).eTag();
+        beforeDownload = () -> {
+            beforeDownload = null;
+            overwrite("bucket/object", new byte[] {2});
+        };
+        assertThatThrownBy(() -> store.getBlob(GetObjectRequest.builder()
+                .bucket("bucket").key("object").ifMatch(tag).build()))
+                .isInstanceOfSatisfying(S3Exception.class, exception -> {
+                    assertThat(exception.statusCode()).isEqualTo(412);
+                    assertThat(exception.awsErrorDetails().sdkHttpResponse()
+                            .firstMatchingHeader("ETag"))
+                            .contains("\"" + store.blobMetadata(
+                                    "bucket", "object").eTag() + "\"");
+                });
+    }
+
+    @Test
+    public void testDownloadRechecksIfNoneMatchAfterOverwrite() {
+        store.createContainer("bucket");
+        put("object", new byte[] {1});
+        String nextTag = HexFormat.of().formatHex(
+                ("\"" + sequence + "\"").getBytes(StandardCharsets.UTF_8)) +
+                "-1";
+        beforeDownload = () -> {
+            beforeDownload = null;
+            overwrite("bucket/object", new byte[] {2});
+        };
+        assertThatThrownBy(() -> store.getBlob(GetObjectRequest.builder()
+                .bucket("bucket").key("object").ifNoneMatch(nextTag).build()))
+                .isInstanceOfSatisfying(S3Exception.class, exception -> {
+                    assertThat(exception.statusCode()).isEqualTo(304);
+                    assertThat(exception.awsErrorDetails().sdkHttpResponse()
+                            .firstMatchingHeader("ETag"))
+                            .contains("\"" + nextTag + "\"");
+                });
+    }
+
+    @Test
+    public void testDownloadRechecksModificationTimeAfterOverwrite() {
+        store.createContainer("bucket");
+        put("object", new byte[] {1});
+        duringDownload = () -> {
+            duringDownload = null;
+            modifiedTime = "2026-01-02T00:00:00Z";
+            overwrite("bucket/object", new byte[] {2});
+        };
+        assertThatThrownBy(() -> store.getBlob(GetObjectRequest.builder()
+                .bucket("bucket").key("object")
+                .ifUnmodifiedSince(Instant.parse(TIME)).build()))
+                .isInstanceOfSatisfying(S3Exception.class, exception ->
+                        assertThat(exception.statusCode()).isEqualTo(412));
+    }
+
+    @Test
+    public void testDownloadRetriesReplacementWithSameTag() throws IOException {
+        store.createContainer("bucket");
+        put("object", new byte[] {1});
+        JsonNode original = nodes.get("bucket/object");
+        duringDownload = () -> {
+            duringDownload = null;
+            node("bucket/object", false, new byte[] {2})
+                    .put("eTag", original.path("eTag").asText());
+        };
+        try (var result = store.getBlob("bucket", "object")) {
+            assertThat(result.readAllBytes()).containsExactly((byte) 2);
+        }
+        assertThat(nodes.get("bucket/object").path("id"))
+                .isNotEqualTo(original.path("id"));
+    }
+
+    @Test
+    public void testDownloadStopsAfterRepeatedOverwrites() {
+        store.createContainer("bucket");
+        put("object", new byte[] {1});
+        beforeDownload = () -> overwrite("bucket/object", new byte[] {2});
+        requestPaths.clear();
+        assertThatThrownBy(() -> store.getBlob("bucket", "object"))
+                .isInstanceOfSatisfying(S3Exception.class, exception ->
+                        assertThat(exception.statusCode()).isEqualTo(503));
+        assertThat(requestPaths.stream()
+                .filter(path -> path.endsWith("/content")).count())
+                .isEqualTo(3);
+    }
+
+    @Test
+    public void testDownloadDetectsDeletionDuringBody() {
+        store.createContainer("bucket");
+        put("object", new byte[] {1});
+        duringDownload = () -> {
+            duringDownload = null;
+            nodes.remove("bucket/object");
+        };
+        assertThatThrownBy(() -> store.getBlob("bucket", "object"))
+                .isInstanceOf(NoSuchKeyException.class);
     }
 
     private void assertConditionalGetStatus(GetObjectRequest request,
@@ -726,7 +876,7 @@ public final class OneDriveBlobStoreTest {
                 new ByteArrayInputStream(payload));
     }
 
-    private JsonNode node(String path, boolean folder, byte[] content) {
+    private ObjectNode node(String path, boolean folder, byte[] content) {
         var result = MAPPER.createObjectNode();
         result.put("id", "item-" + sequence++);
         result.put("name", path.substring(path.lastIndexOf('/') + 1));
@@ -739,6 +889,18 @@ public final class OneDriveBlobStoreTest {
         data.put(result.path("id").asText(), content);
         touchParent(path);
         return result;
+    }
+
+    private void overwrite(String path, byte[] content) {
+        if (!(nodes.get(path) instanceof ObjectNode existing)) {
+            throw new IllegalStateException("Missing fixture object: " + path);
+        }
+        var replacement = existing.deepCopy();
+        replacement.put("eTag", "\"" + sequence++ + "\"");
+        replacement.put("size", content.length);
+        replacement.put("lastModifiedDateTime", modifiedTime);
+        nodes.put(path, replacement);
+        data.put(replacement.path("id").asText(), content);
     }
 
     private void touchParent(String path) {
@@ -766,6 +928,9 @@ public final class OneDriveBlobStoreTest {
                     .getFirst("Authorization");
             if (path.startsWith("/download/")) {
                 assertThat(auth).isNull();
+                if (beforeDownload != null) {
+                    beforeDownload.run();
+                }
                 byte[] content = data.get(path.substring(
                         "/download/".length()));
                 String range = exchange.getRequestHeaders().getFirst("Range");
@@ -776,10 +941,10 @@ public final class OneDriveBlobStoreTest {
                     exchange.getResponseHeaders().add("Content-Range",
                             "bytes " + start + "-" + end + "/" +
                                     content.length);
-                    respond(exchange, 206,
+                    respondDownload(exchange, 206,
                             Arrays.copyOfRange(content, start, end + 1));
                 } else {
-                    respond(exchange, 200, content);
+                    respondDownload(exchange, 200, content);
                 }
                 return;
             }
@@ -924,6 +1089,16 @@ public final class OneDriveBlobStoreTest {
     private static void respondJson(HttpExchange exchange, int status,
             Object value) throws IOException {
         respond(exchange, status, MAPPER.writeValueAsBytes(value));
+    }
+
+    private void respondDownload(HttpExchange exchange, int status, byte[] body)
+            throws IOException {
+        exchange.sendResponseHeaders(status, body.length == 0 ?
+                -1 : body.length);
+        if (duringDownload != null) {
+            duringDownload.run();
+        }
+        exchange.getResponseBody().write(body);
     }
 
     private static void respond(HttpExchange exchange, int status, byte[] body)

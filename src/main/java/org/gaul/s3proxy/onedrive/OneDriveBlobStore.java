@@ -30,6 +30,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.time.Duration;
@@ -99,6 +100,7 @@ public final class OneDriveBlobStore implements BlobStore {
 
     private static final String MULTIPART = ".s3proxy-multipart";
     private static final int SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024;
+    private static final int MAX_DOWNLOAD_ATTEMPTS = 3;
     // Graph requires nonfinal fragments to be multiples of 320 KiB.
     private static final int FRAGMENT_SIZE = 32 * 320 * 1024;
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -286,29 +288,62 @@ public final class OneDriveBlobStore implements BlobStore {
     public ResponseInputStream<GetObjectResponse> getBlob(
             GetObjectRequest request) {
         rejectVersion(request.versionId());
-        JsonNode node = object(request.bucket(), request.key());
-        enforceConditionalGet(request, node);
         var headers = request.range() == null ? Map.<String, String>of() :
                 Map.of("Range", request.range());
-        var response = send("GET", byId(node) + "/content",
-                HttpRequest.BodyPublishers.noBody(), headers, true);
-        if (response.statusCode() == 302 ||
-                response.statusCode() == 307) {
-            String location = response.headers().firstValue("Location")
-                    .orElseThrow(() -> new IllegalStateException(
-                            "Graph download redirect has no Location"));
-            closeBody(response);
-            response = send("GET", location,
-                    HttpRequest.BodyPublishers.noBody(), headers, false);
+        for (int attempt = 0; attempt < MAX_DOWNLOAD_ATTEMPTS; ++attempt) {
+            JsonNode node = object(request.bucket(), request.key());
+            enforceConditionalGet(request, node);
+            Path temporary = temporaryFile();
+            boolean retained = false;
+            try {
+                var response = send("GET", byId(node) + "/content",
+                        HttpRequest.BodyPublishers.noBody(), headers, true);
+                if (response.statusCode() == 302 ||
+                        response.statusCode() == 307) {
+                    closeBody(response);
+                    String location = response.headers().firstValue("Location")
+                            .orElseThrow(() -> new IllegalStateException(
+                                    "Graph download redirect has no Location"));
+                    response = send("GET", location,
+                            HttpRequest.BodyPublishers.noBody(), headers, false);
+                }
+                try (var input = response.body()) {
+                    if (response.statusCode() >= 200 &&
+                            response.statusCode() < 300) {
+                        Files.copy(input, temporary,
+                                StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
+                // The item ID survives overwrites. Verify the revision after
+                // consuming the body, before exposing any bytes to the caller.
+                JsonNode current = object(request.bucket(), request.key());
+                if (!node.path("id").equals(current.path("id")) ||
+                        !node.path("eTag").equals(current.path("eTag"))) {
+                    continue;
+                }
+                check(response);
+                var result = metadata(node).toBuilder()
+                        .contentLength(Files.size(temporary))
+                        .contentRange(response.headers().firstValue(
+                                "Content-Range").orElse(null))
+                        .build();
+                var download = SdkResponses.getResponse(result,
+                        Files.newInputStream(temporary,
+                                StandardOpenOption.DELETE_ON_CLOSE));
+                retained = true;
+                return download;
+            } catch (IOException ioe) {
+                throw new UncheckedIOException(
+                        "OneDrive download staging failed", ioe);
+            } finally {
+                if (!retained) {
+                    deleteTemporary(temporary);
+                }
+            }
         }
-        check(response);
-        var result = metadata(node).toBuilder()
-                .contentLength(response.headers().firstValueAsLong(
-                        "Content-Length").orElse(node.path("size").asLong()))
-                .contentRange(response.headers().firstValue(
-                        "Content-Range").orElse(null))
-                .build();
-        return SdkResponses.getResponse(result, response.body());
+        throw S3Exceptions.fromStatusCode(503,
+                new IllegalStateException(
+                        "OneDrive object changed during every download attempt"));
     }
 
     // Report the actual status: the frontend cannot infer which condition
