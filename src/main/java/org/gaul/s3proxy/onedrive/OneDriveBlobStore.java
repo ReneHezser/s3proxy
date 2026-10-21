@@ -281,7 +281,9 @@ public final class OneDriveBlobStore implements BlobStore {
     public HeadObjectResponse blobMetadata(HeadObjectRequest request) {
         rejectVersion(request.versionId());
         JsonNode node = object(request.bucket(), request.key());
-        return SdkResponses.toHead(metadata(node));
+        return SdkResponses.toHead(metadata(node)).toBuilder()
+                .lastModified(modified(node).truncatedTo(ChronoUnit.SECONDS))
+                .build();
     }
 
     @Override
