@@ -63,8 +63,13 @@ restrictions. Empty path segments, `.`/`..`, directory-marker keys ending in
 `/`, trailing dots, leading/trailing spaces, control characters and
 `"*:<>?\|` are rejected. An object cannot also be a parent directory (`a` and
 `a/b`). An upload can replace an empty directory tree left by deleted
-objects; nonempty directories are never replaced. Empty-directory removal is
-guarded by Graph ETags, and concurrent changes cause the upload to fail.
+objects only when Graph supplies folder `cTag` values; nonempty directories
+are never replaced. Empty-directory removal uses `If-Match` with the folder's
+`cTag`, which tracks descendant changes. Folder `eTag` values do not provide
+this protection. Concurrent changes cause the upload to fail. If any folder
+in the destination tree lacks a `cTag`, replacement is refused before any
+folders are deleted. This includes OneDrive for Business and SharePoint
+document libraries, which do not return folder `cTag` values.
 
 The `.s3proxy-multipart/` prefix is reserved within every bucket.
 

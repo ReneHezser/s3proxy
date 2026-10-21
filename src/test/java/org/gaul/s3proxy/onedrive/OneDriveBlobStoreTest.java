@@ -91,6 +91,7 @@ public final class OneDriveBlobStoreTest {
     private final List<String> authorization = new ArrayList<>();
     private final List<String> fragments = new ArrayList<>();
     private final List<String> requestPaths = new ArrayList<>();
+    private final List<String> deletedPaths = new ArrayList<>();
     private final ByteArrayOutputStream session = new ByteArrayOutputStream();
     private final AtomicReference<Credentials> credentials =
             new AtomicReference<>(new Credentials("", "", "first-token"));
@@ -108,6 +109,7 @@ public final class OneDriveBlobStoreTest {
     private int uploadFailure;
     private int folderDeleteFailure;
     private boolean uploadCancelled;
+    private boolean omitFolderCTags;
     private int sequence;
 
     @BeforeEach
@@ -496,11 +498,16 @@ public final class OneDriveBlobStoreTest {
         store.createContainer("bucket");
         put("a/file", new byte[] {1});
         store.removeBlob("bucket", "a/file");
+        JsonNode original = nodes.get("bucket/a").deepCopy();
         concurrentFolder = "bucket/a";
         assertThatThrownBy(() -> put("a", new byte[] {2}))
                 .isInstanceOfSatisfying(S3Exception.class,
                         exception -> assertThat(exception.statusCode())
                                 .isEqualTo(412));
+        assertThat(nodes.get("bucket/a").path("eTag"))
+                .isEqualTo(original.path("eTag"));
+        assertThat(nodes.get("bucket/a").path("cTag"))
+                .isNotEqualTo(original.path("cTag"));
         try (var result = store.getBlob("bucket", "a/concurrent")) {
             assertThat(result.readAllBytes()).containsExactly((byte) 9);
         }
@@ -513,6 +520,58 @@ public final class OneDriveBlobStoreTest {
                                     .isEqualTo(status));
             assertThat(nodes).containsKey("bucket/a");
         }
+    }
+
+    @Test
+    public void testFolderReplacementRefusesMissingContentTags() {
+        omitFolderCTags = true;
+        store.createContainer("bucket");
+        put("a/b/file", new byte[] {1});
+        store.removeBlob("bucket", "a/b/file");
+        deletedPaths.clear();
+        for (int size : List.of(3, 4 * 1024 * 1024 + 1)) {
+            assertThatThrownBy(() -> put("a", new byte[size]))
+                    .isInstanceOf(S3Exception.class)
+                    .hasMessageContaining("descendant-change tag");
+            assertThat(nodes).containsKeys("bucket/a", "bucket/a/b");
+            assertThat(deletedPaths).isEmpty();
+        }
+    }
+
+    @Test
+    public void testFolderReplacementPreflightsAllContentTags() {
+        store.createContainer("bucket");
+        put("a/b/file", new byte[] {1});
+        store.removeBlob("bucket", "a/b/file");
+        ((ObjectNode) nodes.get("bucket/a/b")).remove("cTag");
+        deletedPaths.clear();
+        assertThatThrownBy(() -> put("a", new byte[] {2}))
+                .isInstanceOf(S3Exception.class)
+                .hasMessageContaining("descendant-change tag");
+        assertThat(nodes).containsKeys("bucket/a", "bucket/a/b");
+        assertThat(deletedPaths).isEmpty();
+    }
+
+    @Test
+    public void testFolderContentTagsTrackDescendantChanges() {
+        store.createContainer("bucket");
+        put("a/b/file", new byte[] {1});
+        JsonNode original = nodes.get("bucket/a").deepCopy();
+        put("a/b/other", new byte[] {2});
+        assertThat(nodes.get("bucket/a").path("eTag"))
+                .isEqualTo(original.path("eTag"));
+        assertThat(nodes.get("bucket/a").path("cTag"))
+                .isNotEqualTo(original.path("cTag"));
+        JsonNode beforeOverwrite = nodes.get("bucket/a").path("cTag");
+        overwrite("bucket/a/b/file", new byte[] {3});
+        assertThat(nodes.get("bucket/a").path("cTag"))
+                .isNotEqualTo(beforeOverwrite);
+        JsonNode beforeDelete = nodes.get("bucket/a").path("cTag");
+        store.removeBlob("bucket", "a/b/other");
+        assertThat(nodes.get("bucket/a").path("cTag"))
+                .isNotEqualTo(beforeDelete);
+        assertThat(nodes.get("bucket/a").path("eTag"))
+                .isEqualTo(original.path("eTag"));
     }
 
     @Test
@@ -943,6 +1002,9 @@ public final class OneDriveBlobStoreTest {
         result.put("name", path.substring(path.lastIndexOf('/') + 1));
         result.put("size", content.length);
         result.put("eTag", "\"" + sequence + "\"");
+        if (folder && !omitFolderCTags) {
+            result.put("cTag", "\"folder-" + sequence++ + "\"");
+        }
         result.put("createdDateTime", TIME);
         result.put("lastModifiedDateTime", modifiedTime);
         result.set(folder ? "folder" : "file", MAPPER.createObjectNode());
@@ -962,15 +1024,18 @@ public final class OneDriveBlobStoreTest {
         replacement.put("lastModifiedDateTime", modifiedTime);
         nodes.put(path, replacement);
         data.put(replacement.path("id").asText(), content);
+        touchParent(path);
     }
 
     private void touchParent(String path) {
         if (!path.isEmpty()) {
             String parent = path.substring(0, Math.max(0,
                     path.lastIndexOf('/'))).toLowerCase(Locale.ROOT);
-            if (nodes.get(parent) instanceof ObjectNode folder) {
-                folder.put("eTag", "\"folder-" + sequence++ + "\"");
+            if (nodes.get(parent) instanceof ObjectNode folder &&
+                    folder.has("cTag")) {
+                folder.put("cTag", "\"folder-" + sequence++ + "\"");
             }
+            touchParent(parent);
         }
     }
 
@@ -1125,6 +1190,7 @@ public final class OneDriveBlobStoreTest {
                         base + "/download/" + existing.path("id").asText());
                 respond(exchange, 302, new byte[0]);
             } else if ("DELETE".equals(method)) {
+                deletedPaths.add(target);
                 String ifMatch = exchange.getRequestHeaders()
                         .getFirst("If-Match");
                 if (target.equals(concurrentFolder)) {
@@ -1136,7 +1202,8 @@ public final class OneDriveBlobStoreTest {
                     return;
                 }
                 if (ifMatch != null &&
-                        !ifMatch.equals(existing.path("eTag").asText())) {
+                        !ifMatch.equals(existing.path("eTag").asText()) &&
+                        !ifMatch.equals(existing.path("cTag").asText())) {
                     respondJson(exchange, 412, Map.of());
                     return;
                 }

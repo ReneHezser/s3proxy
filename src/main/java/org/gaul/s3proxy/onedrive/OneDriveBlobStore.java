@@ -751,24 +751,30 @@ public final class OneDriveBlobStore implements BlobStore {
         collectEmptyFolders(node, folders);
         for (JsonNode folder : folders) {
             JsonNode current = json("GET", byId(folder), null);
+            String tag = folderContentTag(current);
             if (!children(byId(current)).isEmpty()) {
                 throw S3Exceptions.invalidRequest(
                         "A nonempty folder occupies the object key");
             }
-            String tag = current.path("eTag").asText();
-            if (tag.isEmpty()) {
-                throw S3Exceptions.invalidRequest(
-                        "Cannot safely replace a folder without an ETag");
-            }
-            // Graph deletes folders recursively, so pin each empty-folder
-            // removal to the version whose children were checked.
+            // Only cTag guards descendant changes during recursive deletion.
             readJson(send("DELETE", byId(current),
                     HttpRequest.BodyPublishers.noBody(),
                     Map.of("If-Match", tag), true));
         }
     }
 
+    private static String folderContentTag(JsonNode folder) {
+        String tag = folder.path("cTag").asText();
+        if (tag.isEmpty()) {
+            throw S3Exceptions.invalidRequest(
+                    "Cannot safely replace a folder without a " +
+                            "descendant-change tag");
+        }
+        return tag;
+    }
+
     private void collectEmptyFolders(JsonNode folder, List<JsonNode> folders) {
+        folderContentTag(folder);
         for (JsonNode child : children(byId(folder))) {
             if (!child.has("folder")) {
                 throw S3Exceptions.invalidRequest(
