@@ -1,0 +1,660 @@
+name: Test CI
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  dockerhub_publish: ${{ secrets.DOCKER_PASS != '' }}
+
+jobs:
+
+  meta:
+    runs-on: ubuntu-26.04-arm
+    # Every job carries the same timeout, to catch a hang -- an emulator that
+    # stops answering, a test that waits forever -- rather than to budget a
+    # run.  It sits well above what the longest job takes so that a slow
+    # runner does not trip it; without any, GitHub lets a wedged job run for
+    # six hours.
+    timeout-minutes: 20
+    outputs:
+      container_tags: ${{ steps.docker_action_meta.outputs.tags }}
+      container_labels: ${{ steps.docker_action_meta.outputs.labels }}
+      container_buildtime: ${{ fromJSON(steps.docker_action_meta.outputs.json).labels['org.opencontainers.image.created'] }}
+      container_version: ${{ fromJSON(steps.docker_action_meta.outputs.json).labels['org.opencontainers.image.version'] }}
+      container_revision: ${{ fromJSON(steps.docker_action_meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+          persist-credentials: false
+      - name: Docker meta
+        id: docker_action_meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: |
+            name=ghcr.io/${{ github.repository }}/container
+            name=renehezser/s3proxy,enable=${{ env.dockerhub_publish }}
+          flavor: |
+            latest=auto
+          tags: |
+            type=sha,format=long
+            type=sha
+            type=match,pattern=s3proxy-(.*),group=1
+            type=ref,event=branch
+            type=ref,event=pr
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.licenses=Apache-2.0
+  runTests:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    needs: [meta]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: "temurin"
+          java-version: "25"
+          cache: "maven"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      #Run tests
+      - name: Maven Set version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mvn versions:set -DnewVersion=${{ needs.meta.outputs.container_version }}
+      - name: Maven Package
+        run: |
+          mvn verify -DskipTests -Pjdeps
+      - name: Maven Test
+        run: |
+          mvn test
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: surefire-reports-transient
+          path: target/surefire-reports/
+
+      - name: Maven Test with filesystem
+        run: |
+          mkdir /tmp/blobstore
+          # Surefire writes a report per test class; clear the run above so
+          # this lane's artifact holds only its own.
+          rm -rf target/surefire-reports
+          mvn test -Ds3proxy.test.conf=s3proxy-filesystem.conf
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: surefire-reports-filesystem
+          path: target/surefire-reports/
+
+      - name: Maven Test with sftp
+        run: |
+          # SftpTestServerListener starts the embedded SFTP server that
+          # s3proxy-sftp.conf points at.
+          rm -rf target/surefire-reports
+          mvn test -Ds3proxy.test.conf=s3proxy-sftp.conf
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: surefire-reports-sftp
+          path: target/surefire-reports/
+
+      - name: Install s3-tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install tox tox-gh-actions
+      - name: Run s3-tests with transient
+        run: |
+          ./src/test/resources/run-s3-tests.sh s3proxy.conf
+
+      #Store the s3-tests results, which name the tests that failed and the
+      #ones that only passed because a fails_on_s3proxy marker expected them
+      #to fail.  Uploaded even when the lane passed, so that two runs can be
+      #compared.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: s3-tests-results-local
+          path: target/s3-tests-*.xml
+
+      #Store the target
+      - uses: actions/upload-artifact@v7
+        with:
+          name: s3proxy
+          path: target/s3proxy
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jdeps-modules
+          path: target/jdeps-modules.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pom
+          path: pom.xml
+
+  # The filesystem s3-tests lane runs beside the transient one rather than
+  # after it: the two together were the longest job in the run, and they
+  # share nothing but the build.
+  filesystemTests:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    needs: [meta]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: "temurin"
+          java-version: "25"
+          cache: "maven"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Maven Package
+        run: |
+          mvn package -DskipTests
+      - name: Install s3-tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install tox tox-gh-actions
+      - name: Run s3-tests with filesystem
+        run: |
+          mkdir /tmp/blobstore
+          ./src/test/resources/run-s3-tests.sh s3proxy-filesystem.conf
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: s3-tests-results-filesystem
+          path: target/s3-tests-*.xml
+
+  azuriteTests:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    needs: [meta]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: "temurin"
+          java-version: "25"
+          cache: "maven"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Maven Package
+        run: |
+          mvn package -DskipTests
+
+      - name: Install Azurite
+        run: npx --yes --loglevel info azurite@3.37.0 --version
+      - name: Start Azurite
+        shell: bash
+        run: |
+          npx --yes --package azurite@3.37.0 azurite-blob &
+          # A 403 AuthorizationFailure means the blob service is up and
+          # reached its authentication layer.
+          ./src/test/resources/wait-for-url.sh \
+            'http://127.0.0.1:10000/devstoreaccount1?comp=list'
+      - name: Maven Test with Azurite
+        run: |
+          mvn test -Ds3proxy.test.conf=s3proxy-azurite.conf
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: surefire-reports-azurite
+          path: target/surefire-reports/
+
+      - name: Install s3-tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install tox tox-gh-actions
+      - name: Run s3-tests with Azurite
+        run: |
+          ./src/test/resources/run-s3-tests.sh s3proxy-azurite.conf
+          kill $(pidof node)
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: s3-tests-results-azurite
+          path: target/s3-tests-*.xml
+
+  localstackTests:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    needs: [meta]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: "temurin"
+          java-version: "25"
+          cache: "maven"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Maven Package
+        run: |
+          mvn package -DskipTests
+
+      - name: Install LocalStack
+        run: docker pull localstack/localstack:4.14.0
+      - name: Start LocalStack
+        run: |
+          docker run -d --name localstack -p 4566:4566 localstack/localstack:4.14.0
+          # Wait for LocalStack to be ready.  Its health endpoint answers
+          # before s3 is listed, so wait-for-url.sh is not enough here.
+          for i in $(seq 30); do
+            if curl -s http://127.0.0.1:4566/_localstack/health | grep -q '"s3"'; then
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "LocalStack did not offer s3 within 30 seconds" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Maven Test with LocalStack
+        run: |
+          mvn test -Ds3proxy.test.conf=s3proxy-localstack.conf
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: surefire-reports-localstack
+          path: target/surefire-reports/
+
+      - name: Install s3-tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install tox tox-gh-actions
+      - name: Run s3-tests with LocalStack
+        run: |
+          ./src/test/resources/run-s3-tests.sh s3proxy-localstack.conf
+          docker stop localstack
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: s3-tests-results-localstack
+          path: target/s3-tests-*.xml
+
+  # MiniStack is a second S3-compatible emulator behind the same aws-s3
+  # backend the LocalStack lane uses.  It answers a good deal that LocalStack
+  # does not -- server-side encryption, conditional writes, versioning edges
+  # -- so running both keeps the backend honest against two services rather
+  # than one, and each carries its own markers.  It is published on 4567
+  # rather than its own 4566 because AwsSdkTest reads 4566 as LocalStack and
+  # would credit this emulator with LocalStack's gaps.
+  ministackTests:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    needs: [meta]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: "temurin"
+          java-version: "25"
+          cache: "maven"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Maven Package
+        run: |
+          mvn package -DskipTests
+
+      - name: Install MiniStack
+        run: docker pull ministackorg/ministack:1.5.2
+      - name: Start MiniStack
+        run: |
+          docker run -d --name ministack -p 4567:4566 ministackorg/ministack:1.5.2
+          # Probe 127.0.0.1 rather than localhost: hypercorn binds IPv4 alone
+          # inside the container, and a connection to ::1 is accepted and then
+          # reset, which reads as the service never coming up.
+          ./src/test/resources/wait-for-url.sh http://127.0.0.1:4567/
+
+      - name: Maven Test with MiniStack
+        run: |
+          mvn test -Ds3proxy.test.conf=s3proxy-ministack.conf
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: surefire-reports-ministack
+          path: target/surefire-reports/
+
+      - name: Install s3-tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install tox tox-gh-actions
+      - name: Run s3-tests with MiniStack
+        run: |
+          ./src/test/resources/run-s3-tests.sh s3proxy-ministack.conf
+          docker stop ministack
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: s3-tests-results-ministack
+          path: target/s3-tests-*.xml
+
+  fakeGcsServerTests:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    needs: [meta]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: "temurin"
+          java-version: "25"
+          cache: "maven"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "stable"
+
+      - name: Maven Package
+        run: |
+          mvn package -DskipTests
+
+      - name: Install fake-gcs-server
+        run: go install github.com/fsouza/fake-gcs-server@v1.56.1
+      - name: Start fake-gcs-server
+        run: |
+          $HOME/go/bin/fake-gcs-server -backend memory -scheme http -host 127.0.0.1 &
+          ./src/test/resources/wait-for-url.sh \
+            http://127.0.0.1:4443/storage/v1/b
+      - name: Maven Test with fake-gcs-server
+        run: |
+          STORAGE_EMULATOR_HOST=http://localhost:4443 mvn test -Ds3proxy.test.conf=s3proxy-fake-gcs-server.conf
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: surefire-reports-fake-gcs-server
+          path: target/surefire-reports/
+
+      - name: Install s3-tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install tox tox-gh-actions
+      - name: Run s3-tests with fake-gcs-server
+        run: |
+          STORAGE_EMULATOR_HOST=http://localhost:4443 ./src/test/resources/run-s3-tests.sh s3proxy-fake-gcs-server.conf
+          kill $(pidof fake-gcs-server)
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: s3-tests-results-fake-gcs-server
+          path: target/s3-tests-*.xml
+
+  swiftTests:
+    # OpenStack publishes its all-in-one Swift for amd64 alone, so this lane
+    # cannot share the arm64 runner the rest of the workflow uses.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    needs: [meta]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: "temurin"
+          java-version: "25"
+          cache: "maven"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Maven Package
+        run: |
+          mvn package -DskipTests
+
+      # Pinned by digest because neither tag will do: latest is rebuilt from
+      # Swift's master branch daily, and the version tags stopped at 2.25.0 in
+      # 2020.  Bump this deliberately rather than discovering a Swift change
+      # as a failure in an unrelated pull request.  The digest is of the
+      # manifest, not of the amd64 image under it, so it keeps resolving if
+      # OpenStack ever publishes another architecture.
+      - name: Install Swift
+        run: docker pull openstackswift/saio@sha256:e507743c9be31581f0045c6d43352414b50b51e77a2d8ae39b7d8fec7386985d
+      - name: Start Swift
+        run: |
+          # Docker 29 denies AF_ALG sockets in both its default seccomp and
+          # AppArmor profiles (moby/profiles: kernel crypto API mitigation).
+          # Swift probes AF_ALG for kernel crc32c at import and only expects
+          # ENOENT or EAFNOSUPPORT, so the denial's EPERM crash-loops the
+          # proxy-server.  This throwaway emulator needs no confinement.
+          docker run -d --name swift -p 8080:8080 \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            openstackswift/saio@sha256:e507743c9be31581f0045c6d43352414b50b51e77a2d8ae39b7d8fec7386985d
+          # The proxy answers /healthcheck before the account, container and
+          # object servers behind it are all up, so wait on the credentials
+          # actually buying a token -- which is the first thing the lane does.
+          # The budget is generous because first boot builds the rings and
+          # object filesystem, which the runner's network-backed disk serves
+          # far slower than a workstation; a ready container exits the loop
+          # in seconds regardless.
+          for i in $(seq 300); do
+            if curl --silent --fail --output /dev/null \
+                --header 'X-Auth-User: test:tester' \
+                --header 'X-Auth-Key: testing' \
+                http://127.0.0.1:8080/auth/v1.0; then
+              break
+            fi
+            if [ "$i" -eq 300 ]; then
+              echo "Swift did not authenticate within 300 seconds" >&2
+              # The image sends every service's output to files under
+              # /var/log, so docker logs shows nothing even from a healthy
+              # container; name the state and read the files instead.
+              docker ps --all >&2
+              docker inspect --format '{{json .State}}' swift >&2 || true
+              curl --verbose --max-time 5 \
+                  --header 'X-Auth-User: test:tester' \
+                  --header 'X-Auth-Key: testing' \
+                  http://127.0.0.1:8080/auth/v1.0 >&2 || true
+              docker exec swift sh -c \
+                  'find /var/log -type f | while read -r f; do
+                       echo "== $f"; tail -n 25 "$f"; done' >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Maven Test with Swift
+        run: |
+          mvn test -Ds3proxy.test.conf=s3proxy-swift.conf
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: surefire-reports-swift
+          path: target/surefire-reports/
+
+      - name: Install s3-tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install tox tox-gh-actions
+      - name: Run s3-tests with Swift
+        run: |
+          ./src/test/resources/run-s3-tests.sh s3proxy-swift.conf
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: s3-tests-results-swift
+          path: target/s3-tests-*.xml
+
+  kubernetesExamples:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    needs: [meta]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          persist-credentials: false
+      - name: Validate Kubernetes example manifests
+        run: |
+          docker run --rm --volume "$PWD/examples/kubernetes:/examples:ro" \
+            ghcr.io/yannh/kubeconform:v0.7.0 \
+            -strict -summary /examples
+
+  Containerize:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    needs: [runTests, filesystemTests, azuriteTests, localstackTests, ministackTests, fakeGcsServerTests, swiftTests, meta]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: s3proxy
+          path: target
+      - uses: actions/download-artifact@v8
+        with:
+          name: jdeps-modules
+          path: target
+      - uses: actions/download-artifact@v8
+        with:
+          name: pom
+          path: .
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: s3proxy-smoke
+          cache-from: type=gha
+
+      # The jlink-built JRE only contains the modules jdeps discovers
+      # statically, so boot the image that actually ships and exercise the
+      # paths that would break if a reflectively-loaded module were missing.
+      - name: Smoke test image
+        run: |
+          # SunEC loads via the java.security config, invisible to jdeps;
+          # prove EC key generation and ECDSA signing work.
+          docker run --rm --entrypoint keytool s3proxy-smoke \
+            -genkeypair -keyalg EC -groupname secp256r1 -alias smoke \
+            -dname CN=smoke -storepass password -keystore /tmp/smoke.p12
+
+          # java.instrument backs the -javaagent option that
+          # S3PROXY_JAVA_OPTS exists to pass, e.g. an OpenTelemetry or
+          # Prometheus agent.  Nothing references it statically, so jdeps
+          # cannot see it and the VM exits before main once it is dropped.
+          docker run --rm --entrypoint java s3proxy-smoke --list-modules |
+            grep --quiet '^java.instrument'
+
+          # End-to-end request handling against the default filesystem
+          # backend.
+          docker run --detach --name smoke-fs --publish 127.0.0.1:8080:80 \
+            --env S3PROXY_AUTHORIZATION=none s3proxy-smoke
+          for i in $(seq 30); do
+            if curl --silent --output /dev/null http://127.0.0.1:8080/; then
+              break
+            fi
+            sleep 1
+          done
+          echo smoke-payload > payload.txt
+          curl --fail --silent --show-error --request PUT \
+            http://127.0.0.1:8080/smoke-bucket
+          curl --fail --silent --show-error --upload-file payload.txt \
+            http://127.0.0.1:8080/smoke-bucket/payload
+          curl --fail --silent --show-error \
+            http://127.0.0.1:8080/smoke-bucket/payload | grep smoke-payload
+          docker rm --force smoke-fs
+
+          # One HTTPS request to a real backend: a 403 AccessDenied proves
+          # that the TLS handshake and CA trust validation succeeded and
+          # that AWS rejected the bogus credentials; a missing crypto
+          # module or trust store surfaces as a 500 instead.
+          docker run --detach --name smoke-tls --publish 127.0.0.1:8081:80 \
+            --env S3PROXY_AUTHORIZATION=none \
+            --env JCLOUDS_PROVIDER=aws-s3 \
+            --env JCLOUDS_IDENTITY=AKIAIOSFODNN7EXAMPLE \
+            --env JCLOUDS_CREDENTIAL=bogus-credential \
+            s3proxy-smoke
+          for i in $(seq 30); do
+            if curl --silent --output /dev/null http://127.0.0.1:8081/; then
+              break
+            fi
+            sleep 1
+          done
+          status=$(curl --silent --output /dev/null \
+            --write-out '%{http_code}' http://127.0.0.1:8081/)
+          if [ "$status" != "403" ]; then
+            echo "outbound TLS smoke test failed with status $status"
+            exit 1
+          fi
+          docker rm --force smoke-tls
+
+      - name: Dump smoke test logs on failure
+        if: failure()
+        run: |
+          docker logs smoke-fs || true
+          docker logs smoke-tls || true
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v4
+        if: github.event_name != 'pull_request' && env.dockerhub_publish == 'true'
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASS }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ needs.meta.outputs.container_tags }}
+          labels: ${{ needs.meta.outputs.container_labels }}
+          build-args: |
+            BUILDTIME=${{ needs.meta.outputs.container_buildtime }}
+            VERSION=${{ needs.meta.outputs.container_version }}
+            REVISION=${{ needs.meta.outputs.container_revision }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
