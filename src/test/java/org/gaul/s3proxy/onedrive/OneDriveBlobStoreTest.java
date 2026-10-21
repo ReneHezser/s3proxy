@@ -59,6 +59,8 @@ import org.gaul.s3proxy.blobstore.domain.MultipartUpload;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
@@ -101,6 +103,7 @@ public final class OneDriveBlobStoreTest {
     private String modifiedTime = TIME;
     private Runnable beforeDownload;
     private Runnable duringDownload;
+    private Runnable afterListing;
     private int failure;
     private int uploadFailure;
     private int folderDeleteFailure;
@@ -669,6 +672,64 @@ public final class OneDriveBlobStoreTest {
         assertErrorCode("NoSuchUpload", () -> store.abortMultipartUpload(mpu));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"after-listing", "before-download",
+        "during-download", "replaced-item"})
+    public void testMultipartCompletionRejectsChangedRevision(String timing)
+            throws IOException {
+        store.createContainer("bucket");
+        byte[] original = {7, 8};
+        String originalTag = put("assembled", original).eTag();
+        var mpu = store.initiateMultipartUpload(
+                CreateMultipartUploadRequest.builder()
+                        .bucket("bucket").key("assembled").build());
+        var part = store.uploadMultipartPart(mpu,
+                UploadPartRequest.builder().partNumber(1).contentLength(1L)
+                        .build(), new ByteArrayInputStream(new byte[] {1}));
+        String path = "bucket/.s3proxy-multipart/" + mpu.id() + "/1";
+        JsonNode initial = nodes.get(path);
+        afterListing = () -> {
+            afterListing = null;
+            Runnable change = () -> {
+                beforeDownload = null;
+                duringDownload = null;
+                if ("replaced-item".equals(timing)) {
+                    node(path, false, new byte[] {2})
+                            .put("eTag", initial.path("eTag").asText());
+                } else {
+                    overwrite(path, new byte[] {2});
+                }
+            };
+            switch (timing) {
+            case "after-listing" -> change.run();
+            case "before-download" -> beforeDownload = change;
+            case "during-download", "replaced-item" ->
+                duringDownload = change;
+            default -> throw new IllegalArgumentException(timing);
+            }
+        };
+
+        assertErrorCode("InvalidArgument", () ->
+                store.completeMultipartUpload(mpu, SdkRequests.completeRequest(
+                        mpu, List.of(completed(1, "\"" + part.eTag() + "\"")))));
+
+        assertThat(store.blobMetadata("bucket", "assembled").eTag())
+                .isEqualTo(originalTag);
+        try (var result = store.getBlob("bucket", "assembled")) {
+            assertThat(result.readAllBytes()).isEqualTo(original);
+        }
+        assertThat(store.listMultipartUploads("bucket")).extracting("uploadId")
+                .containsExactly(mpu.id());
+        var parts = store.listMultipartUpload(mpu);
+        assertThat(parts).extracting("partNumber").containsExactly(1);
+        store.completeMultipartUpload(mpu, SdkRequests.completeRequest(
+                mpu, List.of(completed(1, parts.get(0).eTag()))));
+        try (var result = store.getBlob("bucket", "assembled")) {
+            assertThat(result.readAllBytes()).containsExactly((byte) 2);
+        }
+        assertThat(store.listMultipartUploads("bucket")).isEmpty();
+    }
+
     @Test
     public void testCredentialsRefreshAndErrorsAreNotHidden() {
         store.list();
@@ -1056,6 +1117,9 @@ public final class OneDriveBlobStoreTest {
                             "?offset=" + (offset + 2));
                 }
                 respondJson(exchange, 200, page);
+                if (afterListing != null) {
+                    afterListing.run();
+                }
             } else if ("/content".equals(operation)) {
                 exchange.getResponseHeaders().add("Location",
                         base + "/download/" + existing.path("id").asText());

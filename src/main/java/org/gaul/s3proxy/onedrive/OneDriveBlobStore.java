@@ -574,10 +574,23 @@ public final class OneDriveBlobStore implements BlobStore {
                                 "Multipart parts must be in ascending order");
                     }
                     previous = completed.partNumber();
-                    JsonNode node = json("GET", item(uploadPath(mpu) + "/" +
-                            part.partNumber()), null);
+                    String partPath = item(uploadPath(mpu) + "/" +
+                            part.partNumber());
+                    JsonNode node = json("GET", partPath, null);
+                    if (!etag(node).equals(unquote(completed.eTag()))) {
+                        throw S3Exceptions.invalidArgument(
+                                "Multipart part or ETag does not match");
+                    }
                     try (var input = download(node)) {
                         input.transferTo(output);
+                    }
+                    // Item IDs survive overwrites; verify the revision after
+                    // consuming the body, before publishing any staged bytes.
+                    JsonNode current = json("GET", partPath, null);
+                    if (!node.path("id").equals(current.path("id")) ||
+                            !node.path("eTag").equals(current.path("eTag"))) {
+                        throw S3Exceptions.invalidArgument(
+                                "Multipart part changed during completion");
                     }
                 }
             }

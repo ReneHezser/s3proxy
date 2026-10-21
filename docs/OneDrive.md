@@ -75,8 +75,11 @@ than 4 MiB use upload sessions with bounded-memory fragments. Multipart parts
 and their target are kept in OneDrive, survive proxy restarts, and are hidden
 from object listings. Completion stages the selected parts on local disk;
 allow enough temporary space for the assembled object and its upload staging
-copy. CopyObject and UploadPartCopy stream through the proxy rather than
-performing an asynchronous Graph copy.
+copy. Completion revalidates each requested part ETag before downloading and
+checks the item ID and Graph ETag again after staging its content. A concurrent
+part replacement fails completion without publishing the object or deleting
+the multipart upload state. CopyObject and UploadPartCopy stream through the
+proxy rather than performing an asynchronous Graph copy.
 
 ## Metadata
 
