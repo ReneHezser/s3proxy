@@ -26,7 +26,10 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -36,10 +39,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import com.azure.core.credential.AccessToken;
+import com.azure.core.credential.TokenCredential;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -47,11 +52,9 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
-import org.gaul.s3proxy.BlobStores;
 import org.gaul.s3proxy.S3Proxy;
 import org.gaul.s3proxy.auth.AuthenticationType;
 import org.gaul.s3proxy.blobstore.BlobStore;
-import org.gaul.s3proxy.blobstore.Credentials;
 import org.gaul.s3proxy.blobstore.MD5;
 import org.gaul.s3proxy.blobstore.S3Exceptions;
 import org.gaul.s3proxy.blobstore.SdkRequests;
@@ -62,6 +65,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import reactor.core.publisher.Mono;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
@@ -93,8 +97,8 @@ public final class OneDriveBlobStoreTest {
     private final List<String> requestPaths = new ArrayList<>();
     private final List<String> deletedPaths = new ArrayList<>();
     private final ByteArrayOutputStream session = new ByteArrayOutputStream();
-    private final AtomicReference<Credentials> credentials =
-            new AtomicReference<>(new Credentials("", "", "first-token"));
+    private final AtomicReference<String> accessToken =
+            new AtomicReference<>("first-token");
     private HttpServer server;
     private BlobStore store;
     private String base;
@@ -120,9 +124,16 @@ public final class OneDriveBlobStoreTest {
         server.start();
         base = "http://127.0.0.1:" + server.getAddress().getPort();
         node("", true, new byte[0]);
-        var properties = new Properties();
-        properties.setProperty("jclouds.endpoint", base + "/v1.0");
-        store = BlobStores.create("onedrive", properties, credentials::get);
+        store = new OneDriveBlobStore(applicationCredentials(),
+                base + "/v1.0", "");
+    }
+
+    private OneDriveApplicationCredentials applicationCredentials() {
+        TokenCredential credential = context -> Mono.just(new AccessToken(
+                accessToken.get(),
+                OffsetDateTime.now(ZoneOffset.UTC).plusSeconds(30)));
+        return new OneDriveApplicationCredentials(credential, "drive-id",
+                base + "/.default", Clock.systemUTC());
     }
 
     @AfterEach
@@ -610,13 +621,10 @@ public final class OneDriveBlobStoreTest {
     @Test
     public void testExplicitDriveAndRootFolder() {
         JsonNode workspace = node("workspace", true, new byte[0]);
-        credentials.set(new Credentials("drive-id", "", "drive-token"));
-        var properties = new Properties();
-        properties.setProperty("jclouds.endpoint", base + "/v1.0");
-        properties.setProperty(OneDriveBlobStore.PROPERTY_ROOT,
-                workspace.path("id").asText());
+        accessToken.set("drive-token");
         store.close();
-        store = BlobStores.create("onedrive", properties, credentials::get);
+        store = new OneDriveBlobStore(applicationCredentials(), base + "/v1.0",
+                workspace.path("id").asText());
         store.createContainer("bucket");
         put("object", new byte[] {1});
         assertThat(store.list().buckets()).extracting("name")
@@ -645,7 +653,8 @@ public final class OneDriveBlobStoreTest {
                         .contentLength((long) last.length).build(),
                 new ByteArrayInputStream(last));
         store.close();
-        store = new OneDriveBlobStore(credentials::get, base + "/v1.0", "");
+        store = new OneDriveBlobStore(applicationCredentials(),
+                base + "/v1.0", "");
         assertThat(store.listMultipartUpload(mpu)).extracting("partNumber")
                 .containsExactly(1, 2);
         var completed = List.of(
@@ -790,9 +799,33 @@ public final class OneDriveBlobStoreTest {
     }
 
     @Test
+    public void testApplicationTokensReachGraphRequests() {
+        var token = new AtomicReference<>("application-token-one");
+        var calls = new AtomicInteger();
+        TokenCredential credential = context -> {
+            calls.incrementAndGet();
+            return Mono.just(new AccessToken(token.get(),
+                    OffsetDateTime.now(ZoneOffset.UTC).plusSeconds(30)));
+        };
+        var supplier = new OneDriveApplicationCredentials(credential,
+                "drive-id", base + "/.default", Clock.systemUTC());
+        store.close();
+        store = new OneDriveBlobStore(supplier, base + "/v1.0", "");
+        authorization.clear();
+        store.list();
+        token.set("application-token-two");
+        store.list();
+        assertThat(authorization).containsExactly(
+                "Bearer application-token-one", "Bearer application-token-two");
+        assertThat(calls.get()).isGreaterThanOrEqualTo(3);
+        assertThat(requestPaths).allMatch(path ->
+                path.startsWith("/v1.0/drives/drive-id/"));
+    }
+
+    @Test
     public void testCredentialsRefreshAndErrorsAreNotHidden() {
         store.list();
-        credentials.set(new Credentials("", "", "second-token"));
+        accessToken.set("second-token");
         store.list();
         assertThat(authorization).containsExactly(
                 "Bearer first-token", "Bearer second-token");
@@ -846,15 +879,11 @@ public final class OneDriveBlobStoreTest {
     }
 
     @Test
-    public void testRejectsUntrustedPaginationLinkAndMissingToken() {
+    public void testRejectsUntrustedPaginationLink() {
         nextLink = "https://example.invalid/steal-token";
         assertThatThrownBy(() -> store.list())
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("outside the configured endpoint");
-        assertThatThrownBy(() -> new OneDriveBlobStore(
-                () -> new Credentials("", "", null), base + "/v1.0", ""))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("session-token");
     }
 
     @Test

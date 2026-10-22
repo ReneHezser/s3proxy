@@ -82,7 +82,7 @@ Maven Central hosts S3Proxy artifacts and the wiki has
 * azureblob
 * filesystem (on-disk storage)
 * google-cloud-storage
-* onedrive (Microsoft Graph, personal and business drives)
+* onedrive (Microsoft Graph, business drives and SharePoint libraries)
 * openstack-swift (Keystone v3 only)
 * sftp (SFTP storage via Apache MINA SSHD)
 * transient (in-memory storage)
@@ -94,8 +94,9 @@ See the wiki for [examples of configurations](https://github.com/gaul/s3proxy/wi
 `jclouds.identity` and `jclouds.credential` name the enduring half of a backend
 credential.  Credentials that expire carry a third part, which
 `jclouds.session-token` names: an AWS session token, an Azure shared access
-signature, a Google OAuth 2.0 access token, a Microsoft Graph access token, or a Keystone token.
-The `onedrive` backend re-reads the credential supplier on each request.
+signature, a Google OAuth 2.0 access token, or a Keystone token.
+The `onedrive` backend instead acquires and renews access tokens using
+Microsoft Entra application credentials.
 
 ```
 jclouds.provider=aws-s3
@@ -125,11 +126,16 @@ Keystone token it holds nears its expiry.
 
 ### OneDrive
 
-Set `jclouds.provider=onedrive` and a Microsoft Graph access token in
-`jclouds.session-token`; `jclouds.identity` optionally names a drive ID and
-`s3proxy.onedrive.root` a folder item ID to use as the root.  Buckets are
-folders below that root.  See [docs/OneDrive.md](docs/OneDrive.md) for the
-configuration, storage mapping and limitations.
+Set `jclouds.provider=onedrive`, an explicit drive ID in `jclouds.identity`,
+and the `s3proxy.onedrive.tenant-id`, `s3proxy.onedrive.client-id`, and
+`s3proxy.onedrive.client-secret` properties.  The connector acquires and
+renews Graph access tokens automatically; `jclouds.session-token` is not
+supported for OneDrive.  Application permissions require administrator
+consent, and personal OneDrive accounts are not supported.
+Optionally set `s3proxy.onedrive.root` to a folder item ID to use as the
+root.  Buckets are folders below that root.
+See [docs/OneDrive.md](docs/OneDrive.md) for configuration, storage mapping
+and limitations.
 
 ## Assigning buckets to backends
 

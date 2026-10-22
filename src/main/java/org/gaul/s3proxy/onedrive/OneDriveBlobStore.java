@@ -43,6 +43,7 @@ import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -97,6 +98,12 @@ import software.amazon.awssdk.services.s3.model.UploadPartResponse;
  */
 public final class OneDriveBlobStore implements BlobStore {
     public static final String PROPERTY_ROOT = "s3proxy.onedrive.root";
+    public static final String PROPERTY_TENANT_ID = "s3proxy.onedrive.tenant-id";
+    public static final String PROPERTY_CLIENT_ID = "s3proxy.onedrive.client-id";
+    public static final String PROPERTY_CLIENT_SECRET =
+            "s3proxy.onedrive.client-secret";
+    public static final String PROPERTY_AUTHORITY_HOST =
+            "s3proxy.onedrive.authority-host";
 
     private static final String MULTIPART = ".s3proxy-multipart";
     private static final int SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024;
@@ -105,7 +112,7 @@ public final class OneDriveBlobStore implements BlobStore {
     private static final int FRAGMENT_SIZE = 32 * 320 * 1024;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private final Supplier<Credentials> creds;
+    private final OneDriveApplicationCredentials creds;
     private final HttpClient client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))
             .followRedirects(HttpClient.Redirect.NEVER)
@@ -115,6 +122,12 @@ public final class OneDriveBlobStore implements BlobStore {
     private final String root;
 
     public OneDriveBlobStore(Supplier<Credentials> creds, String endpoint,
+            String root, Properties properties) {
+        this(OneDriveApplicationCredentials.configure(creds, endpoint,
+                properties), endpoint, root);
+    }
+
+    OneDriveBlobStore(OneDriveApplicationCredentials creds, String endpoint,
             String root) {
         this.creds = creds;
         this.endpoint = URI.create(endpoint.isEmpty() ?
@@ -126,8 +139,7 @@ public final class OneDriveBlobStore implements BlobStore {
                     "OneDrive Graph endpoint must not contain a query");
         }
         String identity = creds.get().identity();
-        this.drive = identity == null || identity.isEmpty() ?
-                "/me/drive" : "/drives/" + encode(identity);
+        this.drive = "/drives/" + encode(identity);
         this.root = root.isEmpty() || "root".equals(root) ?
                 "/root" : "/items/" + encode(root);
         token();
@@ -932,8 +944,8 @@ public final class OneDriveBlobStore implements BlobStore {
     private String token() {
         String token = creds.get().sessionToken();
         if (token == null || token.isBlank()) {
-            throw new IllegalArgumentException(
-                    "OneDrive requires jclouds.session-token");
+            throw new IllegalStateException(
+                    "OneDrive application authentication returned no access token");
         }
         return token;
     }

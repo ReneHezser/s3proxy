@@ -9,7 +9,9 @@ mkdir "${JCLOUDS_FILESYSTEM_BASEDIR}"
 for var in S3PROXY_IDENTITY S3PROXY_CREDENTIAL S3PROXY_KEYSTORE_PASSWORD \
         S3PROXY_ENCRYPTED_BLOBSTORE_PASSWORD \
         S3PROXY_ENCRYPTED_BLOBSTORE_SALT \
-        JCLOUDS_IDENTITY JCLOUDS_CREDENTIAL JCLOUDS_SESSION_TOKEN; do
+        JCLOUDS_IDENTITY JCLOUDS_CREDENTIAL JCLOUDS_SESSION_TOKEN \
+        S3PROXY_ONEDRIVE_TENANT_ID S3PROXY_ONEDRIVE_CLIENT_ID \
+        S3PROXY_ONEDRIVE_CLIENT_SECRET; do
     eval "file=\${${var}_FILE:-}"
     if [ -n "$file" ]; then
         eval "$var=\$(cat \"\$file\")"
@@ -79,6 +81,11 @@ BEGIN {
     prop("jclouds.endpoint", "JCLOUDS_ENDPOINT")
     prop("jclouds.region", "JCLOUDS_REGION")
     prop("jclouds.filesystem.basedir", "JCLOUDS_FILESYSTEM_BASEDIR")
+    prop("s3proxy.onedrive.root", "S3PROXY_ONEDRIVE_ROOT")
+    prop("s3proxy.onedrive.tenant-id", "S3PROXY_ONEDRIVE_TENANT_ID")
+    prop("s3proxy.onedrive.client-id", "S3PROXY_ONEDRIVE_CLIENT_ID")
+    prop("s3proxy.onedrive.client-secret", "S3PROXY_ONEDRIVE_CLIENT_SECRET")
+    prop("s3proxy.onedrive.authority-host", "S3PROXY_ONEDRIVE_AUTHORITY_HOST")
 }' > "$PROPERTIES_FILE"
 
 # Defaults precede S3PROXY_JAVA_OPTS so callers can override them: the last

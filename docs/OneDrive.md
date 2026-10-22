@@ -2,49 +2,138 @@
 
 Status: experimental
 
-The OneDrive backend exposes a Microsoft Graph drive (personal OneDrive,
-OneDrive for Business or a SharePoint document library) as an S3Proxy storage
+The OneDrive backend exposes a Microsoft Graph drive (OneDrive for Business
+or a SharePoint document library) as an S3Proxy storage
 backend through S3Proxy's `BlobStore` interface.
 
 ## Security
 
-Use a Microsoft Graph access token with read/write access to the target drive
-(delegated `Files.ReadWrite`, or the appropriate application permissions and
-administrator consent for the chosen drive). The token is sent only to the
+Use Microsoft Entra application credentials with the appropriate Microsoft Graph
+**application permissions** and administrator consent for the target drive.
+The automatically acquired access token is sent only to the
 configured Graph endpoint; Graph pagination links and upload or download URLs
 outside it are refused or fetched without the token.
 
 Keep S3Proxy client credentials separate from the Graph token. S3 clients
 authenticate to S3Proxy with `s3proxy.identity` and `s3proxy.credential`;
-S3Proxy authenticates to Graph with `jclouds.session-token`.
+S3Proxy authenticates to Graph with access tokens acquired automatically using
+application credentials. Static access tokens and delegated authentication
+are not supported.
 
 Graph endpoints must use HTTPS (plain HTTP is accepted only for `localhost`
 and `127.0.0.1`, for tests).
 
 ## Configuration
 
-Example:
+### Application authentication (automatic token renewal)
 
-```
+For unattended OneDrive for Business or SharePoint deployments, [register an
+application in the drive's Microsoft Entra tenant](https://learn.microsoft.com/en-us/graph/auth-register-app-v2). Grant Microsoft Graph
+**application** permissions for the required read/write operations and obtain
+administrator consent. For example, `Files.ReadWrite.All` permits broad access;
+use a narrower supported permission and resource-specific grant where possible.
+Delegated permissions such as `Files.ReadWrite` are not sufficient for this
+flow. *Personal OneDrive accounts are not supported by application authentication*.
+
+Configure the connector with:
+
+```properties
 s3proxy.authorization=aws-v2-or-v4
 s3proxy.endpoint=http://127.0.0.1:8080
 s3proxy.identity=local-identity
 s3proxy.credential=local-credential
 
 jclouds.provider=onedrive
-jclouds.session-token=MICROSOFT_GRAPH_ACCESS_TOKEN
-# Optional: drive ID; omitted uses /me/drive (delegated tokens only).
-# jclouds.identity=DRIVE_ID
+jclouds.identity=DRIVE_ID
+s3proxy.onedrive.tenant-id=TENANT_ID
+s3proxy.onedrive.client-id=APPLICATION_CLIENT_ID
+s3proxy.onedrive.client-secret=CLIENT_SECRET_VALUE
 # Optional: existing folder item ID; omitted uses the drive root.
 # s3proxy.onedrive.root=FOLDER_ITEM_ID
 # Optional: Graph API endpoint, for example for a sovereign cloud.
 # jclouds.endpoint=https://graph.microsoft.com/v1.0
 ```
 
-The backend does not perform interactive sign-in or refresh a static token.
-For long-running deployments, embed S3Proxy with a `Supplier<Credentials>`
-that renews the access token; the backend reads it again for every request.
-Tokens must target the configured Graph cloud.
+Use the client secret's **value**, not its secret ID. An explicit drive ID is
+required: application tokens cannot use `/me/drive`. Remove
+`jclouds.session-token` from any previous configuration; nonempty values are
+rejected. Tenant ID, client ID, client secret, and drive ID are mandatory.
+
+The connector uses the existing Azure Identity library's client-credentials
+flow. Tokens are cached in memory per connector and renewed on demand when
+within one minute of expiry; concurrent requests share renewal. No refresh
+token is required, and access tokens need not be stored in Kubernetes.
+Authentication failures fail the operation explicitly instead of continuing
+with an expired token. Credentials are validated by acquiring a token during
+connector initialization.
+
+The default authority is `https://login.microsoftonline.com`. For a sovereign
+cloud, configure `s3proxy.onedrive.authority-host` with the corresponding HTTPS
+login origin and `jclouds.endpoint` with that cloud's Graph API endpoint.
+The requested scope is the Graph endpoint's origin followed by `/.default`.
+Application permissions and consent must exist in that cloud.
+
+Client secrets still expire and can be revoked. Rotate the secret before its
+expiry and restart the pods; automatic access-token renewal does not rotate
+the client secret.
+
+### Kubernetes application credentials
+
+Keep the S3 client credentials separate from the application credentials.
+For example, create a Secret in the S3Proxy deployment's namespace:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3proxy-credentials
+type: Opaque
+stringData:
+  s3proxy-identity: "<S3 access key>"
+  s3proxy-credential: "<S3 secret key>"
+  onedrive-client-secret: "<Entra client secret value>"
+```
+
+Do not commit populated Secrets. Restrict access with Kubernetes RBAC and
+enable encryption at rest, or populate the Secret through an external secret
+manager. Tenant ID, client ID, and drive ID are configuration, not passwords.
+
+Using the Secret volume from the
+[cloud-backend deployment](../examples/kubernetes/cloud-backend/deployment.yaml),
+replace its `env` configuration with:
+
+```yaml
+env:
+  - name: JCLOUDS_PROVIDER
+    value: onedrive
+  - name: JCLOUDS_IDENTITY
+    value: "<drive ID>"
+  - name: S3PROXY_ONEDRIVE_TENANT_ID
+    value: "<tenant ID>"
+  - name: S3PROXY_ONEDRIVE_CLIENT_ID
+    value: "<application client ID>"
+  - name: S3PROXY_ONEDRIVE_CLIENT_SECRET_FILE
+    value: /run/secrets/s3proxy/onedrive-client-secret
+  - name: S3PROXY_IDENTITY_FILE
+    value: /run/secrets/s3proxy/s3proxy-identity
+  - name: S3PROXY_CREDENTIAL_FILE
+    value: /run/secrets/s3proxy/s3proxy-credential
+```
+
+Remove the example's `JCLOUDS_IDENTITY_FILE` and `JCLOUDS_CREDENTIAL_FILE`;
+do not set `JCLOUDS_SESSION_TOKEN` or `JCLOUDS_SESSION_TOKEN_FILE` in this mode.
+Use an image built with application-authentication support.
+
+The container also accepts `S3PROXY_ONEDRIVE_CLIENT_SECRET` directly, but the
+`_FILE` variant avoids putting the secret value in the pod specification.
+Tenant and client IDs also support `_FILE` variants. Optional configuration
+uses `S3PROXY_ONEDRIVE_ROOT`, `S3PROXY_ONEDRIVE_AUTHORITY_HOST`, and
+`JCLOUDS_ENDPOINT`. Secret files are read at startup only; after updating the
+client secret, restart the deployment:
+
+```shell
+kubectl rollout restart deployment/s3proxy
+```
 
 ## Storage Mapping
 

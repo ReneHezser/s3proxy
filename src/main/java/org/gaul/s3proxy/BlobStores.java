@@ -96,7 +96,8 @@ public final class BlobStores {
         case "google-cloud-storage" ->
             new GCloudBlobStore(creds, endpoint);
         case "onedrive" -> new OneDriveBlobStore(creds, endpoint,
-                properties.getProperty(OneDriveBlobStore.PROPERTY_ROOT, ""));
+                properties.getProperty(OneDriveBlobStore.PROPERTY_ROOT, ""),
+                properties);
         case "openstack-swift" -> {
             String projectName = properties.getProperty(
                     OpenStackSwiftBlobStore.PROPERTY_PROJECT_NAME, "");
