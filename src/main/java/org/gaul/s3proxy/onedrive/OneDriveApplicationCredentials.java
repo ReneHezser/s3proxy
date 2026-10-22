@@ -21,12 +21,12 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Properties;
+import java.util.function.Supplier;
 
 import com.azure.core.credential.AccessToken;
 import com.azure.core.credential.TokenCredential;
 import com.azure.core.credential.TokenRequestContext;
 import com.azure.identity.ClientSecretCredentialBuilder;
-import com.google.common.base.Supplier;
 
 import org.gaul.s3proxy.blobstore.Credentials;
 import org.jspecify.annotations.Nullable;
