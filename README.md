@@ -9,7 +9,7 @@ S3Proxy implements the
 [S3 API](https://en.wikipedia.org/wiki/Amazon_S3#S3_API_and_competing_services)
 and *proxies* requests, enabling several use cases:
 
-* translation from S3 to Google Cloud, Microsoft Azure, OpenStack Swift, and SFTP
+* translation from S3 to Google Cloud, Microsoft Azure, Microsoft OneDrive, OpenStack Swift, and SFTP
 * testing without Amazon by using the local filesystem
 * extension via middlewares
 * embedding into Java applications
@@ -82,6 +82,7 @@ Maven Central hosts S3Proxy artifacts and the wiki has
 * azureblob
 * filesystem (on-disk storage)
 * google-cloud-storage
+* onedrive (Microsoft Graph, business drives and SharePoint libraries)
 * openstack-swift (Keystone v3 only)
 * sftp (SFTP storage via Apache MINA SSHD)
 * transient (in-memory storage)
@@ -94,6 +95,8 @@ See the wiki for [examples of configurations](https://github.com/gaul/s3proxy/wi
 credential.  Credentials that expire carry a third part, which
 `jclouds.session-token` names: an AWS session token, an Azure shared access
 signature, a Google OAuth 2.0 access token, or a Keystone token.
+The `onedrive` backend instead acquires and renews access tokens using
+Microsoft Entra application credentials.
 
 ```
 jclouds.provider=aws-s3
@@ -120,6 +123,19 @@ is created; a Google service account key, which mints and renews access
 tokens of its own; and the `sftp` password, presented once when the
 connection opens.  `openstack-swift` re-reads the supplier whenever the
 Keystone token it holds nears its expiry.
+
+### OneDrive
+
+Set `jclouds.provider=onedrive`, an explicit drive ID in `jclouds.identity`,
+and the `s3proxy.onedrive.tenant-id`, `s3proxy.onedrive.client-id`, and
+`s3proxy.onedrive.client-secret` properties.  The connector acquires and
+renews Graph access tokens automatically; `jclouds.session-token` is not
+supported for OneDrive.  Application permissions require administrator
+consent, and personal OneDrive accounts are not supported.
+Optionally set `s3proxy.onedrive.root` to a folder item ID to use as the
+root.  Buckets are folders below that root.
+See [docs/OneDrive.md](docs/OneDrive.md) for configuration, storage mapping
+and limitations.
 
 ## Assigning buckets to backends
 
@@ -192,20 +208,20 @@ Some limitations depend on the storage backend:
 
 | limitation | backends |
 | --- | --- |
-| no per-object ACLs, including public-read | `azureblob`, `openstack-swift` |
-| ETag is not the object MD5 | `azureblob`, `google-cloud-storage` |
-| `Cache-Control` not preserved | `google-cloud-storage`, `openstack-swift` |
-| `Content-Encoding` not preserved | `google-cloud-storage` |
-| `Content-Language` not preserved | `openstack-swift` |
+| no per-object ACLs, including public-read | `azureblob`, `onedrive`, `openstack-swift` |
+| ETag is not the object MD5 | `azureblob`, `google-cloud-storage`, `onedrive` |
+| `Cache-Control` not preserved | `google-cloud-storage`, `onedrive`, `openstack-swift` |
+| `Content-Encoding` not preserved | `google-cloud-storage`, `onedrive` |
+| `Content-Language` not preserved | `onedrive`, `openstack-swift` |
 | `Expires` not preserved | `azureblob` |
 | `max-keys=0` not honored | `azureblob` |
-| `UploadPartCopy` streams the data through S3Proxy instead of copying it on the backend | `filesystem`, `transient`, `openstack-swift`, `sftp` |
+| `UploadPartCopy` streams the data through S3Proxy instead of copying it on the backend | `filesystem`, `transient`, `onedrive`, `openstack-swift`, `sftp` |
 | conditional PUT refuses `If-Match`, honoring only `If-None-Match: *` | `openstack-swift` |
 | no object versioning, see [#1137](https://github.com/gaul/s3proxy/issues/1137) | `azureblob` |
 | no object versioning, see [#1138](https://github.com/gaul/s3proxy/issues/1138) | `filesystem` |
-| no object versioning, for want of a service analog | `openstack-swift`, `sftp` |
+| no object versioning, for want of a service analog | `onedrive`, `openstack-swift`, `sftp` |
 | no server-side encryption, see [#1134](https://github.com/gaul/s3proxy/issues/1134) | `google-cloud-storage` |
-| no server-side encryption, by design or for want of a service analog | `filesystem`, `openstack-swift`, `sftp` |
+| no server-side encryption, by design or for want of a service analog | `filesystem`, `onedrive`, `openstack-swift`, `sftp` |
 | SSE-S3 only: AES256 relayed from Azure's own at-rest encryption; SSE-C ([#1135](https://github.com/gaul/s3proxy/issues/1135)) and SSE-KMS refused | `azureblob` |
 
 The backends that do version objects come by it differently.  `aws-s3`

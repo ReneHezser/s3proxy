@@ -39,3 +39,8 @@ Decisions the manifests encode:
 
 The `*_FILE` variables and the shutdown drain require an image newer than
 release 3.3.0.
+
+For OneDrive for Business or SharePoint, see
+[OneDrive application authentication](../../docs/OneDrive.md#kubernetes-application-credentials)
+for automatically renewed access tokens and the corresponding Secret and
+deployment environment settings.

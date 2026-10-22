@@ -30,6 +30,7 @@ import org.gaul.s3proxy.blobstore.Credentials;
 import org.gaul.s3proxy.gcloudsdk.GCloudBlobStore;
 import org.gaul.s3proxy.nio2blob.FilesystemNio2BlobStore;
 import org.gaul.s3proxy.nio2blob.TransientNio2BlobStore;
+import org.gaul.s3proxy.onedrive.OneDriveBlobStore;
 import org.gaul.s3proxy.openstackswift.OpenStackSwiftBlobStore;
 import org.gaul.s3proxy.sftp.SftpBlobStore;
 
@@ -94,6 +95,9 @@ public final class BlobStores {
         }
         case "google-cloud-storage" ->
             new GCloudBlobStore(creds, endpoint);
+        case "onedrive" -> new OneDriveBlobStore(creds, endpoint,
+                properties.getProperty(OneDriveBlobStore.PROPERTY_ROOT, ""),
+                properties);
         case "openstack-swift" -> {
             String projectName = properties.getProperty(
                     OpenStackSwiftBlobStore.PROPERTY_PROJECT_NAME, "");
@@ -118,7 +122,7 @@ public final class BlobStores {
         default -> throw new IllegalArgumentException("Unknown provider: " +
                 provider + ". Supported providers: filesystem, transient," +
                 " aws-s3, azureblob, google-cloud-storage, openstack-swift," +
-                " sftp");
+                " onedrive, sftp");
         };
     }
 

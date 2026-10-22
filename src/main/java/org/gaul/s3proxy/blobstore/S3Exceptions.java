@@ -185,6 +185,17 @@ public final class S3Exceptions {
                 .build();
     }
 
+    /** The multipart upload is absent, expired, or belongs to another key. */
+    public static S3Exception noSuchUpload() {
+        String message = "The specified multipart upload does not exist.";
+        return (S3Exception) S3Exception.builder()
+                .message(message)
+                .statusCode(404)
+                .awsErrorDetails(details(404, "NoSuchUpload", message,
+                        Map.of()))
+                .build();
+    }
+
     /**
      * The 412 a condition earns when the object it guards is not the one
      * the caller named.  Prefer this to a bare 412 wherever the refusal
